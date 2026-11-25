@@ -1224,6 +1224,12 @@ if (tabBarVisible) {
   }
 }
 
+window.addEventListener('agydock:open-oauth-config', () => {
+  if (!accountTabAllowed) return;
+  switchPrimaryTab('accounts');
+  accountsModule.openOAuthPanel?.();
+});
+
 // Initial load + gentle 30s auto-refresh when tab is visible
 fetchUsage();
 setInterval(() => {

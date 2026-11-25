@@ -1012,17 +1012,21 @@ async fn quota_fetch_current(
             QuotaCacheStore::default_store().load_all()
         };
 
-        let snap = quota::fetch_quota_for_blob(
+        let snap = quota::fetch_quota_for_blob_with_options(
             &blob,
             &local_file_blobs,
             account_id,
             &settings,
             &token_cache,
             &cached_map,
-            force,
+            quota::FetchQuotaOptions {
+                force_refresh: force,
+                allow_cli_refresh: true,
+                is_current: true,
+            },
         );
 
-        if snap.error.is_none() {
+        if snap.error.is_none() && !snap.stale {
             let _guard = cache_lock
                 .lock()
                 .map_err(|_| "Quota cache lock poisoned")?;
@@ -1064,6 +1068,15 @@ async fn quota_fetch_account(
             (entry, blob)
         };
 
+        let cur_email = credential::read_blob()
+            .ok()
+            .flatten()
+            .and_then(|b| credential::parse_blob(&b).email);
+        let is_current = cur_email
+            .as_deref()
+            .map(|e| e.eq_ignore_ascii_case(&entry.email))
+            .unwrap_or(false);
+
         let live_blobs = collect_live_token_blobs(true);
 
         let cached_map = {
@@ -1073,20 +1086,24 @@ async fn quota_fetch_account(
             QuotaCacheStore::default_store().load_all()
         };
 
-        let mut snap = quota::fetch_quota_for_blob(
+        let mut snap = quota::fetch_quota_for_blob_with_options(
             &blob,
             &live_blobs,
             Some(entry.id.clone()),
             &settings,
             &token_cache,
             &cached_map,
-            force,
+            quota::FetchQuotaOptions {
+                force_refresh: force,
+                allow_cli_refresh: is_current,
+                is_current,
+            },
         );
         if snap.email == "unknown" && !entry.email.is_empty() {
             snap.email = entry.email;
         }
 
-        if snap.error.is_none() {
+        if snap.error.is_none() && !snap.stale {
             let _guard = cache_lock
                 .lock()
                 .map_err(|_| "Quota cache lock poisoned")?;
@@ -1121,6 +1138,7 @@ async fn quota_fetch_all(state: State<'_, AppState>) -> Result<Vec<AccountQuotaS
         let mut jobs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
         let mut pre_errors: Vec<AccountQuotaSnapshot> = Vec::new();
         let mut seen_emails: Vec<String> = Vec::new();
+        let mut current_email: Option<String> = None;
 
         {
             let _guard = account_lock
@@ -1146,6 +1164,7 @@ async fn quota_fetch_all(state: State<'_, AppState>) -> Result<Vec<AccountQuotaS
             }
             if let Ok(Some(cur_blob)) = credential::read_blob() {
                 if let Some(cur_email) = credential::parse_blob(&cur_blob).email {
+                    current_email = Some(cur_email.clone());
                     let lower = cur_email.trim().to_ascii_lowercase();
                     if !seen_emails.iter().any(|e| e == &lower) {
                         jobs.push((None, cur_blob));
@@ -1154,9 +1173,47 @@ async fn quota_fetch_all(state: State<'_, AppState>) -> Result<Vec<AccountQuotaS
             }
         }
 
-        let live_blobs = collect_live_token_blobs(true);
-        let mut results =
-            quota::fetch_all_accounts_quota(jobs, &live_blobs, &settings, &token_cache, &cached_map);
+        let mut live_blobs = collect_live_token_blobs(true);
+
+        // 若未配置离线 OAuth，但当前登录账号令牌已过期且本机装有 agy CLI，则在批量查询前静默触发一次 CLI 续期
+        if !quota::has_oauth_client_config() {
+            if let Some(ref cur_email) = current_email {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let cur_key = cur_email.trim().to_ascii_lowercase();
+                let empty_primary = credential::CredentialTokens {
+                    email: Some(cur_email.clone()),
+                    ..Default::default()
+                };
+                let cur_tokens = credential::select_freshest_tokens(
+                    &empty_primary,
+                    &live_blobs,
+                    Some(cur_email),
+                    now_ms,
+                );
+                if !quota::has_valid_access_token(&token_cache, &cur_key, &cur_tokens, now_ms)
+                    && proxy::resolve_valid_cli_path(&settings).is_some()
+                {
+                    if matches!(
+                        proxy::silent_refresh_token_via_cli(&settings, true),
+                        proxy::CliRefreshOutcome::Refreshed
+                    ) {
+                        live_blobs = collect_live_token_blobs(true);
+                    }
+                }
+            }
+        }
+
+        let mut results = quota::fetch_all_accounts_quota(
+            jobs,
+            &live_blobs,
+            current_email.as_deref(),
+            &settings,
+            &token_cache,
+            &cached_map,
+        );
         results.extend(pre_errors);
 
         {

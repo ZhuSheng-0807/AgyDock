@@ -194,6 +194,12 @@ pub struct AccountQuotaSnapshot {
     pub earliest_reset_at_ms: Option<i64>,
     #[serde(default)]
     pub error: Option<String>,
+    /// 是否为降级展示的缓存/过期快照（例如纯桌面端令牌超过 1 小时且未配置离线 OAuth）。
+    #[serde(default)]
+    pub stale: bool,
+    /// 非告警性质的状态提示（例如说明为何展示缓存或如何启用离线续期）。
+    #[serde(default)]
+    pub hint: Option<String>,
 }
 
 /// 仅存在于内存中的 OAuth Access Token 缓存。
@@ -296,6 +302,9 @@ impl QuotaCacheStore {
     }
 
     pub fn upsert(&self, snapshot: &AccountQuotaSnapshot) -> Result<(), String> {
+        if snapshot.error.is_some() || snapshot.stale {
+            return Ok(());
+        }
         let key = snapshot.email.trim().to_ascii_lowercase();
         if key.is_empty() || key == "unknown" {
             return Ok(());
@@ -309,7 +318,7 @@ impl QuotaCacheStore {
         let mut map = self.load_all();
         let mut changed = false;
         for snap in snapshots {
-            if snap.error.is_some() {
+            if snap.error.is_some() || snap.stale {
                 continue;
             }
             let key = snap.email.trim().to_ascii_lowercase();
@@ -1361,12 +1370,42 @@ pub fn clear_oauth_client_config() -> Result<OAuthClientStatus, String> {
     clear_oauth_client_config_in(&base_dir)
 }
 
+pub fn has_oauth_client_config() -> bool {
+    load_oauth_client_config().is_some()
+}
+
+pub(crate) fn has_valid_access_token(
+    token_cache: &Arc<Mutex<TokenCache>>,
+    cache_key: &str,
+    tokens: &CredentialTokens,
+    now: i64,
+) -> bool {
+    let mem_valid = token_cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get_valid_with_expiry(cache_key, now))
+        .is_some();
+    if mem_valid {
+        return true;
+    }
+    tokens
+        .access_token
+        .as_ref()
+        .map(|_| {
+            tokens
+                .expires_at_ms
+                .map(|exp| exp > now + TOKEN_REFRESH_SKEW_MS)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false)
+}
+
 fn refresh_oauth_access_token(
     refresh_token: &str,
     proxy: Option<&str>,
 ) -> Result<(String, i64), String> {
     let (client_id, client_secret) = load_oauth_client_config().ok_or_else(|| {
-        "缓存的 access_token 已过期。请启动 Antigravity 或 T3 Code 自动续期，或在「账号管理 → 离线续期」中配置本地 OAuth 刷新凭据".to_string()
+        "缓存的 access_token 已超过 1 小时；纯桌面端需重新登录或在「账号管理 → 离线续期」配置本地 OAuth 凭据，已安装 agy CLI 时将自动续期".to_string()
     })?;
 
     let body = format!(
@@ -1582,6 +1621,8 @@ pub fn error_snapshot_with_fallback(
         if via_proxy.is_some() {
             cached.via_proxy = via_proxy;
         }
+        cached.stale = false;
+        cached.hint = None;
         cached.error = Some(error);
         return cached;
     }
@@ -1595,24 +1636,115 @@ pub fn error_snapshot_with_fallback(
     }
 }
 
-/// 使用给定的凭据 blob 查询账号套餐等级、剩余额度与刷新时间（不直接写磁盘，由调用方统一持久化）。
-pub fn fetch_quota_for_blob(
+/// 当令牌已超过 1 小时且当前环境无可用自动续期通道时，平滑降级返回缓存或空提示快照（不标红报错）。
+pub fn stale_snapshot_with_fallback(
+    email: String,
+    account_id: Option<String>,
+    via_proxy: Option<String>,
+    hint: String,
+    cached_fallback: Option<AccountQuotaSnapshot>,
+) -> AccountQuotaSnapshot {
+    if let Some(mut cached) = cached_fallback {
+        cached.account_id = account_id.or(cached.account_id);
+        if via_proxy.is_some() {
+            cached.via_proxy = via_proxy;
+        }
+        cached.error = None;
+        cached.stale = true;
+        cached.hint = Some(hint);
+        return cached;
+    }
+    AccountQuotaSnapshot {
+        email,
+        account_id,
+        fetched_at_ms: 0,
+        via_proxy,
+        stale: true,
+        hint: Some(hint),
+        error: None,
+        ..Default::default()
+    }
+}
+
+fn expired_desktop_hint(has_cache: bool, is_current: bool) -> String {
+    if is_current {
+        if has_cache {
+            "登录令牌缓存已超过 1 小时，当前展示上次缓存；重新登录、安装 agy CLI 或配置「离线续期」可实时刷新".to_string()
+        } else {
+            "当前登录令牌缓存已超过 1 小时，纯桌面端暂无法后台续期；重新登录后 1 小时内可自动获取，或前往「账号管理 → 离线续期」配置 OAuth 凭据".to_string()
+        }
+    } else if has_cache {
+        "非当前登录账号且令牌缓存已超过 1 小时，当前展示上次缓存；切换至该账号或配置「离线续期」可刷新".to_string()
+    } else {
+        "非当前登录账号且令牌缓存已超过 1 小时；切换至该账号或在「离线续期」配置 OAuth 凭据后可查询".to_string()
+    }
+}
+
+fn cli_cooldown_hint(has_cache: bool) -> String {
+    if has_cache {
+        "当前展示上次缓存快照，点击「刷新额度」将通过本地 agy CLI 静默续期并获取最新额度".to_string()
+    } else {
+        "令牌缓存已超过 1 小时，点击「刷新额度」将通过本地 agy CLI 静默续期并获取额度".to_string()
+    }
+}
+
+fn cli_mismatch_hint(has_cache: bool) -> String {
+    if has_cache {
+        "已执行本地 agy CLI 但未更新该账号令牌（可能 CLI 登录了其他账号），当前展示上次缓存；请在 CLI 同步账号或配置「离线续期」".to_string()
+    } else {
+        "已执行本地 agy CLI 但未更新该账号令牌（可能 CLI 登录了其他账号）；请在 CLI 同步登录或在「账号管理 → 离线续期」配置凭据".to_string()
+    }
+}
+
+fn cli_failed_hint(has_cache: bool, reason: &str) -> String {
+    if has_cache {
+        format!("本地 agy CLI 自动续期未成功（{reason}），当前展示上次缓存；请检查隔离代理连通性或配置「离线续期」")
+    } else {
+        format!("本地 agy CLI 自动续期未成功（{reason}）；请检查隔离代理连通性，或在「账号管理 → 离线续期」配置凭据")
+    }
+}
+
+fn is_auth_expired_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("http 401")
+        || lower.contains("unauthenticated")
+        || lower.contains("invalid authentication credentials")
+        || err.contains("access_token 已")
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FetchQuotaOptions {
+    pub force_refresh: bool,
+    pub allow_cli_refresh: bool,
+    pub is_current: bool,
+}
+
+/// 带完整续期策略选项的额度查询：
+/// - 若已配置离线 OAuth 凭据，直接通过 Google OAuth 续期；
+/// - 否则若缓存 `access_token` 已过期：
+///   - 当前账号且本机存在 `agy` CLI 时，自动静默调用 CLI 续期并重试；
+///   - 纯桌面端无 CLI / 非当前账号时，平滑降级返回缓存或温和提示，不刷屏报错。
+pub fn fetch_quota_for_blob_with_options(
     blob: &[u8],
     extra_blobs: &[Vec<u8>],
     account_id: Option<String>,
     settings: &ProxySettings,
     token_cache: &Arc<Mutex<TokenCache>>,
     cached_map: &HashMap<String, AccountQuotaSnapshot>,
-    force_refresh: bool,
+    opts: FetchQuotaOptions,
 ) -> AccountQuotaSnapshot {
     let primary_tokens = credential::extract_tokens(blob);
-    let tokens = credential::select_freshest_tokens(&primary_tokens, extra_blobs, None, now_ms());
+    let mut tokens = credential::select_freshest_tokens(&primary_tokens, extra_blobs, None, now_ms());
     let email = tokens
         .email
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let cache_key = email.trim().to_ascii_lowercase();
     let cached_fallback = cached_map.get(&cache_key).cloned();
+    let has_cache = cached_fallback
+        .as_ref()
+        .map(|c| !c.pools.is_empty() || c.plan.tier_code != "unknown")
+        .unwrap_or(false);
 
     let (port, _, is_listening, _) = proxy::resolve_port(settings);
     let (winhttp_proxy, via_proxy) = if is_listening && port > 0 {
@@ -1625,15 +1757,91 @@ pub fn fetch_quota_for_blob(
     };
     let proxy_ref = winhttp_proxy.as_deref();
 
+    let oauth_configured = has_oauth_client_config();
+    let mut tried_cli = false;
+
+    if !oauth_configured && !has_valid_access_token(token_cache, &cache_key, &tokens, now_ms()) {
+        if opts.allow_cli_refresh {
+            tried_cli = true;
+            match proxy::silent_refresh_token_via_cli(settings, opts.force_refresh) {
+                proxy::CliRefreshOutcome::Refreshed => {
+                    let mut live_blobs = credential::read_local_token_file_blobs();
+                    if let Ok(Some(cb)) = credential::read_blob() {
+                        live_blobs.push(cb);
+                    }
+                    tokens = credential::select_freshest_tokens(
+                        &primary_tokens,
+                        &live_blobs,
+                        Some(&email),
+                        now_ms(),
+                    );
+                    if !has_valid_access_token(token_cache, &cache_key, &tokens, now_ms()) {
+                        return stale_snapshot_with_fallback(
+                            email,
+                            account_id,
+                            via_proxy,
+                            cli_mismatch_hint(has_cache),
+                            cached_fallback,
+                        );
+                    }
+                }
+                proxy::CliRefreshOutcome::NotInstalled => {
+                    return stale_snapshot_with_fallback(
+                        email,
+                        account_id,
+                        via_proxy,
+                        expired_desktop_hint(has_cache, opts.is_current),
+                        cached_fallback,
+                    );
+                }
+                proxy::CliRefreshOutcome::Cooldown => {
+                    return stale_snapshot_with_fallback(
+                        email,
+                        account_id,
+                        via_proxy,
+                        cli_cooldown_hint(has_cache),
+                        cached_fallback,
+                    );
+                }
+                proxy::CliRefreshOutcome::Failed(reason) => {
+                    return stale_snapshot_with_fallback(
+                        email,
+                        account_id,
+                        via_proxy,
+                        cli_failed_hint(has_cache, &reason),
+                        cached_fallback,
+                    );
+                }
+            }
+        } else {
+            return stale_snapshot_with_fallback(
+                email,
+                account_id,
+                via_proxy,
+                expired_desktop_hint(has_cache, opts.is_current),
+                cached_fallback,
+            );
+        }
+    }
+
     let (mut access_token, mut already_refreshed) = match resolve_access_token(
         token_cache,
         &cache_key,
         &tokens,
         proxy_ref,
-        force_refresh,
+        opts.force_refresh,
     ) {
         Ok(res) => res,
         Err(err) => {
+            if !oauth_configured && is_auth_expired_error(&err) {
+                return stale_snapshot_with_fallback(
+                    email,
+                    account_id,
+                    via_proxy,
+                    expired_desktop_hint(has_cache, opts.is_current),
+                    cached_fallback,
+                );
+            }
             return error_snapshot_with_fallback(
                 email,
                 account_id,
@@ -1652,7 +1860,7 @@ pub fn fetch_quota_for_blob(
         }
     });
 
-    let load_res = post_cloudcode_with_retry(
+    let mut load_res = post_cloudcode_with_retry(
         &CLOUDCODE_HOSTS,
         "/v1internal:loadCodeAssist",
         &load_body,
@@ -1664,12 +1872,119 @@ pub fn fetch_quota_for_blob(
         proxy_ref,
     );
 
+    // 若本地令牌无明确过期时间戳但服务端返回 401，且未配置离线 OAuth，则尝试一次 CLI 静默续期或平滑降级
+    if let Err(ref err) = load_res {
+        if !oauth_configured && is_auth_expired_error(err) {
+            if let Ok(mut guard) = token_cache.lock() {
+                guard.remove(&cache_key);
+            }
+            if opts.allow_cli_refresh && !tried_cli {
+                match proxy::silent_refresh_token_via_cli(settings, opts.force_refresh) {
+                    proxy::CliRefreshOutcome::Refreshed => {
+                        let mut live_blobs = credential::read_local_token_file_blobs();
+                        if let Ok(Some(cb)) = credential::read_blob() {
+                            live_blobs.push(cb);
+                        }
+                        let updated = credential::select_freshest_tokens(
+                            &primary_tokens,
+                            &live_blobs,
+                            Some(&email),
+                            now_ms(),
+                        );
+                        if let Some(new_tok) = updated.access_token.clone() {
+                            if new_tok != access_token {
+                                tokens = updated;
+                                access_token = new_tok.clone();
+                                if let Some(exp) = tokens.expires_at_ms {
+                                    if let Ok(mut guard) = token_cache.lock() {
+                                        guard.set(cache_key.clone(), new_tok, exp);
+                                    }
+                                }
+                                load_res = post_cloudcode_with_retry(
+                                    &CLOUDCODE_HOSTS,
+                                    "/v1internal:loadCodeAssist",
+                                    &load_body,
+                                    &mut access_token,
+                                    &mut already_refreshed,
+                                    &tokens,
+                                    token_cache,
+                                    &cache_key,
+                                    proxy_ref,
+                                );
+                            } else {
+                                return stale_snapshot_with_fallback(
+                                    email,
+                                    account_id,
+                                    via_proxy,
+                                    cli_mismatch_hint(has_cache),
+                                    cached_fallback,
+                                );
+                            }
+                        } else {
+                            return stale_snapshot_with_fallback(
+                                email,
+                                account_id,
+                                via_proxy,
+                                cli_mismatch_hint(has_cache),
+                                cached_fallback,
+                            );
+                        }
+                    }
+                    proxy::CliRefreshOutcome::NotInstalled => {
+                        return stale_snapshot_with_fallback(
+                            email,
+                            account_id,
+                            via_proxy,
+                            expired_desktop_hint(has_cache, opts.is_current),
+                            cached_fallback,
+                        );
+                    }
+                    proxy::CliRefreshOutcome::Cooldown => {
+                        return stale_snapshot_with_fallback(
+                            email,
+                            account_id,
+                            via_proxy,
+                            cli_cooldown_hint(has_cache),
+                            cached_fallback,
+                        );
+                    }
+                    proxy::CliRefreshOutcome::Failed(reason) => {
+                        return stale_snapshot_with_fallback(
+                            email,
+                            account_id,
+                            via_proxy,
+                            cli_failed_hint(has_cache, &reason),
+                            cached_fallback,
+                        );
+                    }
+                }
+            } else {
+                return stale_snapshot_with_fallback(
+                    email,
+                    account_id,
+                    via_proxy,
+                    expired_desktop_hint(has_cache, opts.is_current),
+                    cached_fallback,
+                );
+            }
+        }
+    }
+
     let (preferred_host, project_id, plan) = match load_res {
         Ok((host, val)) => {
             let (proj, plan) = parse_load_code_assist(&val);
             (host, proj, plan)
         }
         Err(err) => {
+            if !oauth_configured && is_auth_expired_error(&err) {
+                return stale_snapshot_with_fallback(
+                    email,
+                    account_id,
+                    via_proxy,
+                    expired_desktop_hint(has_cache, opts.is_current),
+                    cached_fallback,
+                );
+            }
             return error_snapshot_with_fallback(
                 email,
                 account_id,
@@ -1757,6 +2072,8 @@ pub fn fetch_quota_for_blob(
                 min_remaining_fraction,
                 earliest_reset_at_ms,
                 error: Some(err),
+                stale: false,
+                hint: None,
             };
         }
     };
@@ -1780,6 +2097,8 @@ pub fn fetch_quota_for_blob(
         min_remaining_fraction,
         earliest_reset_at_ms,
         error: None,
+        stale: false,
+        hint: None,
     }
 }
 
@@ -1787,6 +2106,7 @@ pub fn fetch_quota_for_blob(
 pub fn fetch_all_accounts_quota(
     items: Vec<(Option<String>, Vec<u8>)>,
     extra_blobs: &[Vec<u8>],
+    current_email: Option<&str>,
     settings: &ProxySettings,
     token_cache: &Arc<Mutex<TokenCache>>,
     cached_map: &HashMap<String, AccountQuotaSnapshot>,
@@ -1794,6 +2114,11 @@ pub fn fetch_all_accounts_quota(
     if items.is_empty() {
         return Vec::new();
     }
+
+    let current_lower = current_email
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
 
     let total = items.len();
     let queue: Mutex<VecDeque<(usize, Option<String>, Vec<u8>)>> = Mutex::new(
@@ -1818,14 +2143,25 @@ pub fn fetch_all_accounts_quota(
                 let Some((idx, acc_id, blob)) = job else {
                     break;
                 };
-                let snap = fetch_quota_for_blob(
+                let blob_email = credential::parse_blob(&blob)
+                    .email
+                    .map(|e| e.trim().to_ascii_lowercase());
+                let is_current = match (&current_lower, &blob_email) {
+                    (Some(c), Some(b)) => c == b,
+                    _ => false,
+                };
+                let snap = fetch_quota_for_blob_with_options(
                     &blob,
                     extra_blobs,
                     acc_id,
                     settings,
                     token_cache,
                     cached_map,
-                    false,
+                    FetchQuotaOptions {
+                        force_refresh: false,
+                        allow_cli_refresh: false,
+                        is_current,
+                    },
                 );
                 if let Ok(mut out) = results.lock() {
                     out[idx] = Some(snap);
@@ -2179,5 +2515,106 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_snapshot_preserves_cache_and_cache_store_skips_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "agydock-quota-stale-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = QuotaCacheStore::new(dir.join("quota-cache.json"));
+
+        let fresh = AccountQuotaSnapshot {
+            email: "user@example.com".to_string(),
+            account_id: Some("acc-1".to_string()),
+            fetched_at_ms: 1_700_000_000_000,
+            plan: PlanTierInfo {
+                tier_code: "pro".to_string(),
+                tier_label: "Google AI Pro".to_string(),
+                ..Default::default()
+            },
+            min_remaining_fraction: Some(0.8),
+            stale: false,
+            hint: None,
+            error: None,
+            ..Default::default()
+        };
+        store.upsert(&fresh).unwrap();
+
+        let degraded = stale_snapshot_with_fallback(
+            "user@example.com".to_string(),
+            Some("acc-1".to_string()),
+            None,
+            "缓存已超过 1 小时".to_string(),
+            Some(fresh.clone()),
+        );
+        assert!(degraded.stale);
+        assert!(degraded.error.is_none());
+        assert_eq!(degraded.hint.as_deref(), Some("缓存已超过 1 小时"));
+        assert_eq!(degraded.plan.tier_code, "pro");
+        assert_eq!(degraded.fetched_at_ms, 1_700_000_000_000);
+
+        let empty_stale = stale_snapshot_with_fallback(
+            "other@example.com".to_string(),
+            None,
+            None,
+            "无缓存".to_string(),
+            None,
+        );
+        assert!(empty_stale.stale);
+        assert!(empty_stale.error.is_none());
+        assert_eq!(empty_stale.fetched_at_ms, 0);
+
+        // Upserting stale snapshots must NOT overwrite good cache or persist empty stale rows
+        store.upsert(&degraded).unwrap();
+        store.upsert_many(&[degraded, empty_stale]).unwrap();
+        let loaded = store.load_all();
+        assert_eq!(loaded.len(), 1);
+        let saved = loaded.get("user@example.com").unwrap();
+        assert!(!saved.stale);
+        assert_eq!(saved.plan.tier_code, "pro");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_blob_without_oauth_or_cli_returns_stale_instead_of_error() {
+        if has_oauth_client_config() {
+            return;
+        }
+        let expired_json = serde_json::json!({
+            "email": "desktop-only@example.com",
+            "token": {
+                "access_token": "expired-token",
+                "refresh_token": "rt-valid",
+                "expiry": "2020-01-01T00:00:00Z"
+            }
+        });
+        let blob = serde_json::to_vec(&expired_json).unwrap();
+        let settings = ProxySettings::default();
+        let token_cache = Arc::new(Mutex::new(TokenCache::new()));
+        let cached_map = HashMap::new();
+
+        let snap = fetch_quota_for_blob_with_options(
+            &blob,
+            &[],
+            None,
+            &settings,
+            &token_cache,
+            &cached_map,
+            FetchQuotaOptions {
+                force_refresh: false,
+                allow_cli_refresh: false,
+                is_current: true,
+            },
+        );
+        assert!(snap.stale);
+        assert!(snap.error.is_none());
+        assert!(snap.hint.as_deref().unwrap_or_default().contains("1 小时"));
+        assert_eq!(snap.fetched_at_ms, 0);
     }
 }

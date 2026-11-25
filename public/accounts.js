@@ -486,11 +486,23 @@ export function initAccountsModule() {
     }
 
     const plan = snap.plan || {};
+    const pools = Array.isArray(snap.pools) ? snap.pools : [];
     const creditsText = formatCreditsSummary(plan);
     const loadingTag = isLoading ? '<span class="tag">查询中</span>' : '';
     const errTag = snap.error
       ? `<span class="tag tag-err" title="${escapeHtml(snap.error)}">查询异常</span>`
-      : '';
+      : snap.stale && pools.length > 0
+        ? `<span class="tag" title="${escapeHtml(snap.hint || '当前展示缓存快照')}">缓存</span>`
+        : '';
+
+    if (snap.stale && pools.length === 0 && !snap.error) {
+      return `
+        <div class="quota-cell-empty mono" title="${escapeHtml(
+          snap.hint || '令牌缓存已超过 1 小时'
+        )}">令牌已过期 · 点击查看</div>
+      `;
+    }
+
     const topLine = `
       <div class="quota-cell-top">
         ${tierBadgeHtml(plan)}
@@ -503,7 +515,6 @@ export function initAccountsModule() {
       </div>
     `;
 
-    const pools = Array.isArray(snap.pools) ? snap.pools : [];
     if (pools.length > 0) {
       const minFrac = snap.minRemainingFraction;
       const pctText = formatRemainingPct(minFrac);
@@ -1220,6 +1231,8 @@ export function initAccountsModule() {
       }
       if (snap?.error) {
         appendLog(`[!] 查询 ${snap.email || id} 额度异常: ${snap.error}`);
+      } else if (snap?.stale) {
+        appendLog(`[i] ${snap.email || id}: ${snap.hint || '令牌缓存已超过 1 小时，当前保留上次缓存'}`);
       } else {
         const tier = snap?.plan?.tierLabel || '未知';
         const minPct = formatRemainingPct(snap?.minRemainingFraction);
@@ -1243,6 +1256,7 @@ export function initAccountsModule() {
     try {
       const results = await tauriInvoke('quota_fetch_all');
       let okCount = 0;
+      let staleCount = 0;
       let errCount = 0;
       const updated = [];
       for (const snap of results || []) {
@@ -1254,6 +1268,9 @@ export function initAccountsModule() {
         if (snap?.error) {
           errCount += 1;
           appendLog(`[!] ${snap.email || '未知账号'} 查询异常: ${snap.error}`);
+        } else if (snap?.stale) {
+          staleCount += 1;
+          appendLog(`[i] ${snap.email || '未知账号'}: ${snap.hint || '令牌缓存已超过 1 小时'}`);
         } else {
           okCount += 1;
         }
@@ -1262,12 +1279,23 @@ export function initAccountsModule() {
       if (!results || !results.length) {
         appendLog('[i] 当前没有可查询的已保存账号。');
         showNotice('当前没有可查询的账号。', 'warn');
-      } else if (errCount === 0) {
+      } else if (errCount === 0 && staleCount === 0) {
         appendLog(`[OK] 额度刷新完成：共更新 ${okCount} 个账号。`);
         showNotice(`已更新 ${okCount} 个账号的套餐与剩余额度。`, 'ok');
+      } else if (errCount === 0) {
+        if (okCount > 0) {
+          appendLog(`[OK] 额度刷新完成：更新 ${okCount} 个，另有 ${staleCount} 个过期/离线账号保留缓存。`);
+          showNotice(`已更新 ${okCount} 个账号，另有 ${staleCount} 个离线/过期账号保留缓存。`, 'ok');
+        } else {
+          appendLog(`[i] ${staleCount} 个账号令牌缓存已超过 1 小时，纯桌面端可重新登录或配置「离线续期」刷新。`);
+          showNotice(`${staleCount} 个账号令牌已超过 1 小时（可重新登录或配置「离线续期」刷新）。`, 'warn');
+        }
       } else {
         setLogsExpanded(true);
-        showNotice(`额度刷新完成：${okCount} 个成功，${errCount} 个异常（详情见日志）。`, 'warn');
+        showNotice(
+          `额度刷新完成：${okCount} 个成功${staleCount > 0 ? `，${staleCount} 个保留缓存` : ''}，${errCount} 个异常（详情见日志）。`,
+          'warn'
+        );
       }
     } catch (err) {
       appendLog(`[X] 批量查询额度失败: ${err?.message || err}`);
@@ -1286,8 +1314,8 @@ export function initAccountsModule() {
     const key = normalizeEmailKey(email);
     const existing = state.quotaMap.get(key);
     const isFresh =
-      existing && !existing.error && existing.fetchedAtMs && Date.now() - existing.fetchedAtMs < QUOTA_STALE_MS;
-    if (!force && isFresh) return;
+      existing && !existing.error && !existing.stale && existing.fetchedAtMs && Date.now() - existing.fetchedAtMs < QUOTA_STALE_MS;
+    if (!force && (isFresh || existing?.stale)) return;
     try {
       const snap = await tauriInvoke('quota_fetch_current', { forceRefresh: false });
       const snapKey = normalizeEmailKey(snap?.email || email);
@@ -1626,6 +1654,15 @@ export function initAccountsModule() {
       } else {
         stopActiveRefresh();
       }
+    },
+    openOAuthPanel() {
+      ensureLoaded().then(() => {
+        if (!els.oauthPanel) return;
+        els.oauthPanel.classList.remove('hidden');
+        loadOAuthStatus();
+        els.oauthPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        els.oauthClientId?.focus();
+      });
     },
   };
 }

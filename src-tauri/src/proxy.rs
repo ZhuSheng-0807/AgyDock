@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs}
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -3143,6 +3143,149 @@ pub fn test_cli_proxy(settings: &ProxySettings) -> ActionResponse {
             logs,
             error: Some(msg),
         }
+    }
+}
+
+/// CLI 静默续期结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliRefreshOutcome {
+    /// 已通过本地 agy CLI 成功触发一次令牌续期（或刚完成续期）。
+    Refreshed,
+    /// 本机未检测到可用的 agy CLI（纯桌面端环境）。
+    NotInstalled,
+    /// 处于后台冷却窗口内，跳过重复拉起 CLI。
+    Cooldown,
+    /// CLI 执行失败或超时（包含简要原因）。
+    Failed(String),
+}
+
+/// 解析本机真实可用的 `agy.exe` 路径（排除 AgyDock 自身的 Shim 目录）。
+pub fn resolve_valid_cli_path(settings: &ProxySettings) -> Option<PathBuf> {
+    let shim_dir = cli_shim_dir();
+    let configured = settings.cli_path.trim();
+    if !configured.is_empty() {
+        let p = PathBuf::from(configured);
+        if p.is_file() && !is_inside_dir(&p, &shim_dir) {
+            return Some(p);
+        }
+    }
+    detect_cli_candidates().into_iter().next().map(PathBuf::from)
+}
+
+/// 若本机存在 `agy` CLI，则通过当前隔离代理（若监听）或系统网络静默执行一次 `agy models`，
+/// 促使 CLI 自动续期当前登录账号的 OAuth `access_token`。
+///
+/// 内置并发互斥锁与冷却时间（后台自动触发 60s 冷却；手动触发 5s 内复用刚成功的结果），
+/// 避免定时轮询反复拉起子进程。
+pub fn silent_refresh_token_via_cli(settings: &ProxySettings, force: bool) -> CliRefreshOutcome {
+    const AUTO_COOLDOWN: Duration = Duration::from_secs(60);
+    const MANUAL_DEDUP: Duration = Duration::from_secs(5);
+    const CLI_TIMEOUT: Duration = Duration::from_secs(12);
+
+    static CLI_REFRESH_GUARD: OnceLock<Mutex<Option<(Instant, bool)>>> = OnceLock::new();
+    let guard_mutex = CLI_REFRESH_GUARD.get_or_init(|| Mutex::new(None));
+
+    let Some(cli_path) = resolve_valid_cli_path(settings) else {
+        return CliRefreshOutcome::NotInstalled;
+    };
+
+    let Ok(mut last_run) = guard_mutex.lock() else {
+        return CliRefreshOutcome::Failed("CLI 续期锁异常".to_string());
+    };
+
+    if let Some((when, last_ok)) = *last_run {
+        let elapsed = when.elapsed();
+        if last_ok && elapsed < MANUAL_DEDUP {
+            return CliRefreshOutcome::Refreshed;
+        }
+        if !force && elapsed < AUTO_COOLDOWN {
+            return CliRefreshOutcome::Cooldown;
+        }
+    }
+
+    let mut cmd = Command::new(&cli_path);
+    cmd.arg("models")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(parent) = cli_path.parent() {
+        cmd.current_dir(parent);
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let (port, _, is_listening, _) = resolve_port(settings);
+    if is_listening && port > 0 {
+        let proxy_url = format!("http://{}:{}", settings.proxy_host.trim(), port);
+        apply_proxy_env_only(&mut cmd, settings, &proxy_url);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            *last_run = Some((Instant::now(), false));
+            return CliRefreshOutcome::Failed(format!("无法启动 agy CLI: {err}"));
+        }
+    };
+
+    let stderr_handle = child.stderr.take().map(|pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.take(8192).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).to_string()
+        })
+    });
+
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let mut exit_status = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(err) => {
+                *last_run = Some((Instant::now(), false));
+                return CliRefreshOutcome::Failed(format!("等待 CLI 返回失败: {err}"));
+            }
+        }
+    }
+
+    let stderr_text = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if timed_out {
+        *last_run = Some((Instant::now(), false));
+        return CliRefreshOutcome::Failed("CLI 自动续期超时 (12s)，请检查代理节点".to_string());
+    }
+
+    if exit_status.map(|s| s.success()).unwrap_or(false) {
+        *last_run = Some((Instant::now(), true));
+        CliRefreshOutcome::Refreshed
+    } else {
+        *last_run = Some((Instant::now(), false));
+        let first_err = stderr_text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| l.chars().take(90).collect::<String>());
+        let code = exit_status.and_then(|s| s.code()).unwrap_or(-1);
+        let detail = match first_err {
+            Some(line) => format!("退出码 {code}: {line}"),
+            None => format!("退出码 {code}"),
+        };
+        CliRefreshOutcome::Failed(detail)
     }
 }
 

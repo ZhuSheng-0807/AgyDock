@@ -236,7 +236,13 @@ export function renderQuotaDetailHtml(snapshot, { showRefreshBtn = false, accoun
   metaItems.push(
     `<span>通道: ${escapeHtml(snapshot.viaProxy ? `隔离代理 ${snapshot.viaProxy}` : '系统网络/直连')}</span>`
   );
-  metaItems.push(`<span>查询于 ${escapeHtml(formatTimeClock(snapshot.fetchedAtMs))}</span>`);
+  if (snapshot.fetchedAtMs) {
+    metaItems.push(
+      `<span>${snapshot.stale ? '缓存于' : '查询于'} ${escapeHtml(formatTimeClock(snapshot.fetchedAtMs))}</span>`
+    );
+  } else {
+    metaItems.push('<span>尚未获取到实时快照</span>');
+  }
 
   const refreshBtnHtml = showRefreshBtn
     ? `<button type="button" class="btn" data-act="quota-refresh" data-id="${escapeHtml(
@@ -247,6 +253,8 @@ export function renderQuotaDetailHtml(snapshot, { showRefreshBtn = false, accoun
   const notices = [];
   if (snapshot.error) {
     notices.push(`<div class="notice notice-error">${escapeHtml(snapshot.error)}</div>`);
+  } else if (snapshot.stale && snapshot.hint) {
+    notices.push(`<div class="notice">${escapeHtml(snapshot.hint)}</div>`);
   }
   if (plan.ineligibleReason) {
     notices.push(`<div class="notice">账号受限提示: ${escapeHtml(plan.ineligibleReason)}</div>`);
@@ -279,24 +287,37 @@ export function initUsageQuotaPanel() {
     };
   }
 
+  const COLLAPSE_STORAGE_KEY = 'agydock.quotaPanelCollapsed';
+
   const els = {
     panel,
     tierBadge: document.getElementById('quotaTierBadge'),
     accountEmail: document.getElementById('quotaAccountEmail'),
     creditsTag: document.getElementById('quotaCreditsTag'),
+    collapsedSummary: document.getElementById('quotaCollapsedSummary'),
     toggleModelsBtn: document.getElementById('quotaToggleModelsBtn'),
     refreshBtn: document.getElementById('quotaRefreshBtn'),
+    collapseBtn: document.getElementById('quotaCollapseBtn'),
     poolsStage: document.getElementById('quotaPoolsStage'),
     modelsWrap: document.getElementById('quotaModelsWrap'),
+    metaBar: document.getElementById('quotaMetaBar'),
     metaLeft: document.getElementById('quotaMetaLeft'),
     metaRight: document.getElementById('quotaMetaRight'),
   };
 
   panel.classList.remove('hidden');
 
+  let initialCollapsed = false;
+  try {
+    initialCollapsed = localStorage.getItem(COLLAPSE_STORAGE_KEY) === '1';
+  } catch {
+    initialCollapsed = false;
+  }
+
   const state = {
     active: true,
     loading: false,
+    collapsed: initialCollapsed,
     modelsExpanded: false,
     currentEmail: null,
     present: false,
@@ -305,6 +326,27 @@ export function initUsageQuotaPanel() {
     autoTimer: null,
     initialized: false,
   };
+
+  function applyCollapsedLayout(summaryText, hasModels) {
+    panel.classList.toggle('quota-panel-collapsed', state.collapsed);
+    els.poolsStage.classList.toggle('hidden', state.collapsed);
+    if (els.metaBar) {
+      els.metaBar.classList.toggle('hidden', state.collapsed);
+    }
+    if (state.collapsed) {
+      els.modelsWrap.classList.add('hidden');
+      els.toggleModelsBtn.classList.add('hidden');
+    } else {
+      els.toggleModelsBtn.classList.toggle('hidden', !hasModels);
+    }
+    if (els.collapsedSummary) {
+      els.collapsedSummary.textContent = summaryText || '';
+      els.collapsedSummary.classList.toggle('hidden', !state.collapsed || !summaryText);
+    }
+    if (els.collapseBtn) {
+      els.collapseBtn.textContent = state.collapsed ? '展开' : '收起';
+    }
+  }
 
   function emitQuotaUpdated(snapshot) {
     if (!snapshot || !snapshot.email || snapshot.email === 'unknown') return;
@@ -323,12 +365,12 @@ export function initUsageQuotaPanel() {
       els.tierBadge.innerHTML = '<span class="tag tag-tier tag-tier-unknown">未登录</span>';
       els.accountEmail.textContent = '未检测到登录凭据';
       els.creditsTag.classList.add('hidden');
-      els.toggleModelsBtn.classList.add('hidden');
       els.poolsStage.innerHTML =
         '<div class="quota-empty">当前未登录 Antigravity 账号，请在客户端登录或在「账号管理」页切换账号。</div>';
       els.modelsWrap.classList.add('hidden');
       els.metaLeft.textContent = '等待登录账号';
       els.metaRight.textContent = '';
+      applyCollapsedLayout('未登录', false);
       return;
     }
 
@@ -336,20 +378,29 @@ export function initUsageQuotaPanel() {
       els.tierBadge.innerHTML = '<span class="tag tag-tier tag-tier-unknown">查询中</span>';
       els.accountEmail.textContent = email || '读取中...';
       els.creditsTag.classList.add('hidden');
-      els.toggleModelsBtn.classList.add('hidden');
       els.poolsStage.innerHTML = '<div class="quota-empty">正在读取套餐与剩余额度...</div>';
       els.modelsWrap.classList.add('hidden');
       els.metaLeft.textContent = '正在连接 Cloud Code Assist...';
       els.metaRight.textContent = '';
+      applyCollapsedLayout('读取中...', false);
       return;
     }
 
     const plan = snap.plan || {};
-    els.tierBadge.innerHTML = `${tierBadgeHtml(plan)}${
-      plan.tierLabel && plan.tierCode !== 'unknown'
-        ? `<span class="panel-note">${escapeHtml(plan.tierLabel)}</span>`
-        : ''
-    }`;
+    const pools = Array.isArray(snap.pools) ? snap.pools : [];
+    const staleTag =
+      snap.stale && pools.length > 0
+        ? `<span class="tag" title="${escapeHtml(snap.hint || '当前展示缓存快照')}">缓存</span>`
+        : '';
+    if (snap.stale && pools.length === 0 && plan.tierCode === 'unknown') {
+      els.tierBadge.innerHTML = '<span class="tag tag-tier tag-tier-unknown">未获取</span>';
+    } else {
+      els.tierBadge.innerHTML = `${tierBadgeHtml(plan)}${
+        plan.tierLabel && plan.tierCode !== 'unknown'
+          ? `<span class="panel-note">${escapeHtml(plan.tierLabel)}</span>`
+          : ''
+      }${staleTag}`;
+    }
     els.accountEmail.textContent = email || '未知账号';
 
     const creditsSummary = formatCreditsSummary(plan);
@@ -362,17 +413,20 @@ export function initUsageQuotaPanel() {
 
     const models = Array.isArray(snap.models) ? snap.models : [];
     const buckets = Array.isArray(snap.summaryBuckets) ? snap.summaryBuckets : [];
-    if (models.length > 0 || buckets.length > 0) {
-      els.toggleModelsBtn.classList.remove('hidden');
+    const hasModels = models.length > 0 || buckets.length > 0;
+    if (hasModels) {
       els.toggleModelsBtn.textContent = state.modelsExpanded
         ? `收起明细 (${models.length})`
         : `模型明细 (${models.length})`;
-    } else {
-      els.toggleModelsBtn.classList.add('hidden');
     }
 
-    const pools = Array.isArray(snap.pools) ? snap.pools : [];
+    let summaryText = '';
     if (pools.length > 0) {
+      const minPct = formatRemainingPct(snap.minRemainingFraction);
+      const resetPart = snap.earliestResetAtMs
+        ? ` · ${formatResetCountdown(snap.earliestResetAtMs)}`
+        : '';
+      summaryText = `${snap.stale ? '缓存 · ' : ''}最低剩余 ${minPct}${resetPart}`;
       els.poolsStage.innerHTML = `
         <div class="quota-pool-grid">
           ${pools
@@ -408,13 +462,25 @@ export function initUsageQuotaPanel() {
             .join('')}
         </div>
       `;
+    } else if (snap.stale) {
+      summaryText = '令牌已超过 1 小时（可配置离线续期或重新登录）';
+      const hintText =
+        snap.hint || '当前登录令牌已超过 1 小时，纯桌面端暂无法自动续期；重新登录或在「账号管理 → 离线续期」配置后可查询。';
+      els.poolsStage.innerHTML = `
+        <div class="quota-hint-row">
+          <span class="quota-hint-text">${escapeHtml(hintText)}</span>
+          <button type="button" class="link-btn" data-act="goto-oauth">配置离线续期 →</button>
+        </div>
+      `;
     } else if (snap.error) {
+      summaryText = '查询异常';
       els.poolsStage.innerHTML = `<div class="notice notice-error">${escapeHtml(snap.error)}</div>`;
     } else {
+      summaryText = '暂无额度数据';
       els.poolsStage.innerHTML = '<div class="quota-empty">暂无可用的额度池数据</div>';
     }
 
-    if (state.modelsExpanded && (models.length > 0 || buckets.length > 0)) {
+    if (!state.collapsed && state.modelsExpanded && hasModels) {
       els.modelsWrap.classList.remove('hidden');
       els.modelsWrap.innerHTML = `
         <div class="quota-models-inner">
@@ -431,16 +497,27 @@ export function initUsageQuotaPanel() {
     leftParts.push(snap.viaProxy ? `隔离代理 ${snap.viaProxy}` : '系统网络/直连');
     if (plan.refreshCadenceHint) leftParts.push(plan.refreshCadenceHint);
     if (snap.projectId) leftParts.push(`Project: ${snap.projectId}`);
-    if (snap.error && pools.length > 0) leftParts.push(`刷新异常(显示缓存): ${snap.error}`);
+    if (snap.error && pools.length > 0) {
+      leftParts.push(`刷新异常(显示缓存): ${snap.error}`);
+    } else if (snap.stale && pools.length > 0 && snap.hint) {
+      leftParts.push(snap.hint);
+    }
     els.metaLeft.textContent = leftParts.join(' · ');
-    els.metaRight.textContent = `更新于 ${formatTimeClock(snap.fetchedAtMs)}`;
+    els.metaRight.textContent = snap.fetchedAtMs
+      ? `${snap.stale ? '缓存于' : '更新于'} ${formatTimeClock(snap.fetchedAtMs)}`
+      : '未获取实时快照';
+
+    applyCollapsedLayout(summaryText, hasModels);
   }
 
   async function refresh(forceRefresh = true) {
     if (state.loading) return;
     state.loading = true;
-    els.refreshBtn.disabled = true;
-    els.refreshBtn.textContent = '查询中...';
+    const showBusyUi = forceRefresh || !state.snapshot;
+    if (showBusyUi) {
+      els.refreshBtn.disabled = true;
+      els.refreshBtn.textContent = '查询中...';
+    }
     try {
       const cur = await tauriInvoke('accounts_current').catch(() => null);
       state.present = Boolean(cur?.present);
@@ -514,6 +591,21 @@ export function initUsageQuotaPanel() {
     state.modelsExpanded = !state.modelsExpanded;
     render();
   });
+  els.collapseBtn?.addEventListener('click', () => {
+    state.collapsed = !state.collapsed;
+    try {
+      localStorage.setItem(COLLAPSE_STORAGE_KEY, state.collapsed ? '1' : '0');
+    } catch {
+      // ignore storage errors
+    }
+    render();
+  });
+  els.poolsStage.addEventListener('click', (evt) => {
+    const oauthLink = evt.target.closest('[data-act="goto-oauth"]');
+    if (oauthLink) {
+      window.dispatchEvent(new CustomEvent('agydock:open-oauth-config'));
+    }
+  });
 
   window.addEventListener('agydock:quota-updated', (evt) => {
     const detail = evt.detail || {};
@@ -546,7 +638,7 @@ export function initUsageQuotaPanel() {
       }
     }, COUNTDOWN_TICK_MS);
     state.autoTimer = setInterval(() => {
-      if (state.active && document.visibilityState === 'visible') {
+      if (state.active && document.visibilityState === 'visible' && !state.snapshot?.stale) {
         refresh(false);
       }
     }, AUTO_REFRESH_MS);

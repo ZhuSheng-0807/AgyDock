@@ -1,6 +1,6 @@
 {
   "name": "antigravity-usage-dashboard",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Minimalist local usage dashboard for Antigravity session transcripts",
   "type": "module",
   "private": true,

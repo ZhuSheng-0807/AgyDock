@@ -1429,6 +1429,27 @@ body {
   padding: 6px 0;
 }
 
+.quota-hint-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 2px 0;
+  font-size: 12px;
+  color: var(--ink-secondary);
+}
+
+.quota-hint-text {
+  min-width: 0;
+  flex: 1 1 280px;
+  line-height: 1.5;
+}
+
+.quota-panel-collapsed .panel-header {
+  border-bottom: none;
+}
+
 .quota-pool-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));

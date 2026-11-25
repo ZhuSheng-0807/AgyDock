@@ -139,17 +139,19 @@
           <span class="quota-tier-badge-group" id="quotaTierBadge"></span>
           <span class="panel-note mono" id="quotaAccountEmail">—</span>
           <span class="tag hidden" id="quotaCreditsTag"></span>
+          <span class="panel-note mono hidden" id="quotaCollapsedSummary"></span>
         </div>
         <div class="panel-actions">
           <button type="button" class="btn hidden" id="quotaToggleModelsBtn">模型明细</button>
           <button type="button" class="btn" id="quotaRefreshBtn" title="刷新当前登录账号的套餐等级与模型剩余额度">刷新额度</button>
+          <button type="button" class="btn" id="quotaCollapseBtn" title="收起或展开套餐与额度面板">收起</button>
         </div>
       </div>
       <div class="quota-panel-body" id="quotaPoolsStage">
         <div class="quota-empty">正在读取套餐与剩余额度...</div>
       </div>
       <div class="quota-models-wrap hidden" id="quotaModelsWrap"></div>
-      <div class="quota-meta-bar mono">
+      <div class="quota-meta-bar mono" id="quotaMetaBar">
         <span id="quotaMetaLeft">—</span>
         <span id="quotaMetaRight">—</span>
       </div>
@@ -668,7 +670,7 @@
       <div class="settings-grid">
         <div class="field-row">
           <span class="field-label">说明</span>
-          <span class="panel-note">活跃中的 Antigravity / T3 Code / agy CLI 令牌会自动复用，无需配置。仅当未启动客户端的离线账号 access_token 已过期时才需要；凭据使用 Windows DPAPI 加密存于本机。</span>
+          <span class="panel-note">新登录 1 小时内的令牌，以及本地 agy CLI / T3 Code 刷新的令牌会自动复用（已安装 agy CLI 时将自动静默续期当前账号）。纯桌面端超过 1 小时或查询其他离线账号时，可在此配置本地 OAuth 凭据；密钥使用 Windows DPAPI 加密存于本机。</span>
         </div>
         <div class="field-row">
           <label class="field-label" for="accountOAuthClientId">Client ID</label>
