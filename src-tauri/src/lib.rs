@@ -18,8 +18,9 @@ use proxy::{
     ProxySnapshot,
 };
 use scanner::{
-    aggregate_usage, build_sessions_csv, get_default_brain_dir, load_persisted_brain_dir,
-    save_persisted_brain_dir, BrainScanner, SessionDetailResponse, UsageResponse,
+    aggregate_usage_with_filter, build_sessions_csv, get_default_brain_dir,
+    load_persisted_brain_dir, save_persisted_brain_dir, AggregateRangeFilter, BrainScanner,
+    SessionDetailResponse, UsageResponse,
 };
 use serde::Serialize;
 use std::fs;
@@ -105,16 +106,26 @@ fn get_usage(
     model: Option<String>,
     source: Option<String>,
     day: Option<String>,
+    start_day: Option<String>,
+    end_day: Option<String>,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
 ) -> Result<UsageResponse, String> {
     let mut scanner = state.scanner.lock().map_err(|_| "Scanner lock poisoned")?;
     let scan_res = scanner.scan();
-    Ok(aggregate_usage(
+    Ok(aggregate_usage_with_filter(
         &scan_res,
         range.as_deref(),
         granularity.as_deref(),
         model.as_deref(),
         source.as_deref(),
         day.as_deref(),
+        AggregateRangeFilter {
+            start_day: start_day.as_deref(),
+            end_day: end_day.as_deref(),
+            start_ts,
+            end_ts,
+        },
         None,
     ))
 }
@@ -195,23 +206,40 @@ fn export_csv(
     model: Option<String>,
     source: Option<String>,
     day: Option<String>,
+    start_day: Option<String>,
+    end_day: Option<String>,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
 ) -> Result<ExportCsvResult, String> {
     let data = {
         let mut scanner = state.scanner.lock().map_err(|_| "Scanner lock poisoned")?;
         let scan_res = scanner.scan();
-        aggregate_usage(
+        aggregate_usage_with_filter(
             &scan_res,
             range.as_deref(),
             granularity.as_deref(),
             model.as_deref(),
             source.as_deref(),
             day.as_deref(),
+            AggregateRangeFilter {
+                start_day: start_day.as_deref(),
+                end_day: end_day.as_deref(),
+                start_ts,
+                end_ts,
+            },
             None,
         )
     };
 
-    let suffix = data.meta.selected_day.as_deref().unwrap_or(&data.meta.range);
-    let default_name = format!("antigravity-usage-{suffix}.csv");
+    let range_suffix = match (&data.meta.selected_start_day, &data.meta.selected_end_day) {
+        (Some(s), Some(e)) => format!("{s}_to_{e}"),
+        _ => data
+            .meta
+            .selected_day
+            .clone()
+            .unwrap_or_else(|| data.meta.range.clone()),
+    };
+    let default_name = format!("antigravity-usage-{range_suffix}.csv");
     let mut dialog = rfd::FileDialog::new()
         .set_title("导出 Antigravity 用量明细 CSV")
         .set_file_name(&default_name)
@@ -1931,6 +1959,7 @@ pub fn run() {
                             }
                         }
                         "quit" => {
+                            let _ = proxy::restore_managed_system_proxy_if_active();
                             app.exit(0);
                         }
                         _ => {}

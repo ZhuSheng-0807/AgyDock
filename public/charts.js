@@ -96,7 +96,12 @@ export function renderTokenTrendChart({
   series,
   visibleSeries,
   onSelectDay = null,
+  onSelectRange = null,
 }) {
+  if (typeof container._cleanupBrush === 'function') {
+    container._cleanupBrush();
+    container._cleanupBrush = null;
+  }
   const existingSvg = container.querySelector('svg');
   if (existingSvg) existingSvg.remove();
 
@@ -178,8 +183,10 @@ export function renderTokenTrendChart({
   const xStep = pickTickStep(series.length, plotW, 56);
 
   const barsGroup = el('g');
+  const brushGroup = el('g');
   const overlayGroup = el('g');
   const xAxisGroup = el('g');
+  const hoverBgs = [];
 
   series.forEach((item, idx) => {
     const slotX = margin.left + idx * slotW;
@@ -191,17 +198,23 @@ export function renderTokenTrendChart({
       y: margin.top,
       width: slotW,
       height: plotH,
+      rx: 4,
+      ry: 4,
       fill: 'rgba(24, 24, 27, 0.045)',
       opacity: 0,
     });
     barsGroup.appendChild(hoverBg);
+    hoverBgs.push(hoverBg);
 
     let yCursor = margin.top + plotH;
-    for (const layer of layerOrder) {
+    const activeLayers = layerOrder.filter((layer) => (item[layer.key] || 0) > 0);
+    const barRadius = Math.min(3, Math.max(0, barW * 0.25));
+    activeLayers.forEach((layer, layerIdx) => {
       const value = item[layer.key] || 0;
-      if (value <= 0) continue;
       const segH = Math.max(1, (value / yMax) * plotH);
       yCursor -= segH;
+      const isTop = layerIdx === activeLayers.length - 1;
+      const r = isTop && segH >= 4 ? barRadius : 0;
 
       barsGroup.appendChild(
         el('rect', {
@@ -209,10 +222,12 @@ export function renderTokenTrendChart({
           y: yCursor,
           width: barW,
           height: segH,
+          rx: r || null,
+          ry: r || null,
           fill: layer.color,
         })
       );
-    }
+    });
 
     // X-axis labels
     if (idx % xStep === 0 || idx === series.length - 1) {
@@ -235,77 +250,234 @@ export function renderTokenTrendChart({
         );
       }
     }
-
-    // Interactive hit zone
-    const hit = el('rect', {
-      x: slotX,
-      y: margin.top,
-      width: slotW,
-      height: plotH,
-      fill: 'transparent',
-      style: onSelectDay ? 'cursor: pointer;' : 'cursor: crosshair;',
-    });
-
-    const showTip = (evt) => {
-      hoverBg.setAttribute('opacity', '1');
-      const drillHint = onSelectDay
-        ? '<div class="tt-hint">点击柱条查看当日 24 小时明细</div>'
-        : '';
-      const speedRow =
-        item.avgOutputTokensPerSec > 0
-          ? `<div class="tt-row">
-               <span class="tt-key">输出速度</span>
-               <span class="tt-val">${formatSpeed(item.avgOutputTokensPerSec)}</span>
-             </div>`
-          : '';
-      tooltipEl.innerHTML = `
-        <div class="tt-title">${item.label}</div>
-        <div class="tt-row">
-          <span class="tt-key"><span class="swatch swatch-output"></span>Output</span>
-          <span class="tt-val">${formatTokensM(item.outputTokens)}</span>
-        </div>
-        <div class="tt-row">
-          <span class="tt-key"><span class="swatch swatch-input"></span>Input</span>
-          <span class="tt-val">${formatTokensM(item.inputTokens)}</span>
-        </div>
-        <div class="tt-row">
-          <span class="tt-key"><span class="swatch swatch-cache"></span>Cache Read</span>
-          <span class="tt-val">${formatTokensM(item.cacheReadTokens)}</span>
-        </div>
-        <div class="tt-divider"></div>
-        <div class="tt-row">
-          <span class="tt-key">总计</span>
-          <span class="tt-val">${formatTokensM(item.totalTokens)}</span>
-        </div>
-        <div class="tt-row">
-          <span class="tt-key">调用 / 命中率</span>
-          <span class="tt-val">${item.callCount} 次 · ${formatPct(item.cacheHitRate)}</span>
-        </div>
-        ${speedRow}
-        ${drillHint}
-      `;
-      tooltipEl.classList.remove('hidden');
-      positionTooltip(tooltipEl, evt.clientX, evt.clientY);
-    };
-
-    hit.addEventListener('mouseenter', showTip);
-    hit.addEventListener('mousemove', (evt) => positionTooltip(tooltipEl, evt.clientX, evt.clientY));
-    hit.addEventListener('mouseleave', () => {
-      hoverBg.setAttribute('opacity', '0');
-      tooltipEl.classList.add('hidden');
-    });
-    if (onSelectDay) {
-      hit.addEventListener('click', () => {
-        hoverBg.setAttribute('opacity', '0');
-        tooltipEl.classList.add('hidden');
-        onSelectDay(item.key);
-      });
-    }
-
-    overlayGroup.appendChild(hit);
   });
 
+  const brushRect = el('rect', {
+    x: margin.left,
+    y: margin.top,
+    width: 0,
+    height: plotH,
+    rx: 4,
+    ry: 4,
+    fill: 'rgba(59, 110, 165, 0.14)',
+    stroke: 'rgba(59, 110, 165, 0.65)',
+    'stroke-width': 1,
+    opacity: 0,
+    'pointer-events': 'none',
+  });
+  brushGroup.appendChild(brushRect);
+
+  const plotHit = el('rect', {
+    x: margin.left,
+    y: margin.top,
+    width: plotW,
+    height: plotH,
+    fill: 'transparent',
+    style: onSelectRange ? 'cursor: crosshair;' : onSelectDay ? 'cursor: pointer;' : 'cursor: crosshair;',
+  });
+
+  let hoveredIdx = -1;
+  let dragging = false;
+  let isBrushing = false;
+  let dragStartIdx = -1;
+  let dragCurIdx = -1;
+  let dragStartX = 0;
+
+  const idxFromClientX = (clientX) => {
+    const svgRect = svg.getBoundingClientRect();
+    const scaleX = width / Math.max(1, svgRect.width);
+    const svgX = (clientX - svgRect.left) * scaleX;
+    return Math.max(0, Math.min(series.length - 1, Math.floor((svgX - margin.left) / slotW)));
+  };
+
+  const clearHover = () => {
+    if (hoveredIdx >= 0 && hoverBgs[hoveredIdx]) {
+      hoverBgs[hoveredIdx].setAttribute('opacity', '0');
+    }
+    hoveredIdx = -1;
+  };
+
+  const renderSingleTooltip = (idx, clientX, clientY) => {
+    const item = series[idx];
+    if (!item) return;
+    let hintText = '';
+    if (onSelectRange && onSelectDay) {
+      hintText = '拖拽框选时段，或点击查看当日 24 小时明细';
+    } else if (onSelectRange) {
+      hintText = '按住左键拖拽框选具体时段查看详情';
+    } else if (onSelectDay) {
+      hintText = '点击柱条查看当日 24 小时明细';
+    }
+    const drillHint = hintText ? `<div class="tt-hint">${hintText}</div>` : '';
+    const speedRow =
+      item.avgOutputTokensPerSec > 0
+        ? `<div class="tt-row">
+             <span class="tt-key">输出速度</span>
+             <span class="tt-val">${formatSpeed(item.avgOutputTokensPerSec)}</span>
+           </div>`
+        : '';
+    tooltipEl.innerHTML = `
+      <div class="tt-title">${item.label}</div>
+      <div class="tt-row">
+        <span class="tt-key"><span class="swatch swatch-output"></span>Output</span>
+        <span class="tt-val">${formatTokensM(item.outputTokens)}</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-key"><span class="swatch swatch-input"></span>Input</span>
+        <span class="tt-val">${formatTokensM(item.inputTokens)}</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-key"><span class="swatch swatch-cache"></span>Cache Read</span>
+        <span class="tt-val">${formatTokensM(item.cacheReadTokens)}</span>
+      </div>
+      <div class="tt-divider"></div>
+      <div class="tt-row">
+        <span class="tt-key">总计</span>
+        <span class="tt-val">${formatTokensM(item.totalTokens)}</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-key">调用 / 命中率</span>
+        <span class="tt-val">${item.callCount} 次 · ${formatPct(item.cacheHitRate)}</span>
+      </div>
+      ${speedRow}
+      ${drillHint}
+    `;
+    tooltipEl.classList.remove('hidden');
+    positionTooltip(tooltipEl, clientX, clientY);
+  };
+
+  const renderBrushTooltip = (lo, hi, clientX, clientY) => {
+    let outTok = 0;
+    let inTok = 0;
+    let cacheTok = 0;
+    let totalTok = 0;
+    let calls = 0;
+    for (let i = lo; i <= hi; i += 1) {
+      const b = series[i];
+      outTok += b.outputTokens || 0;
+      inTok += b.inputTokens || 0;
+      cacheTok += b.cacheReadTokens || 0;
+      totalTok += b.totalTokens || 0;
+      calls += b.callCount || 0;
+    }
+    const denom = inTok + cacheTok;
+    const hitRate = denom > 0 ? cacheTok / denom : 0;
+    const title =
+      lo === hi ? series[lo].label : `${series[lo].label} ~ ${series[hi].label}`;
+    tooltipEl.innerHTML = `
+      <div class="tt-title">框选 ${title} (${hi - lo + 1} 段)</div>
+      <div class="tt-row">
+        <span class="tt-key"><span class="swatch swatch-output"></span>Output</span>
+        <span class="tt-val">${formatTokensM(outTok)}</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-key"><span class="swatch swatch-input"></span>Input</span>
+        <span class="tt-val">${formatTokensM(inTok)}</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-key"><span class="swatch swatch-cache"></span>Cache Read</span>
+        <span class="tt-val">${formatTokensM(cacheTok)}</span>
+      </div>
+      <div class="tt-divider"></div>
+      <div class="tt-row">
+        <span class="tt-key">区间总计</span>
+        <span class="tt-val">${formatTokensM(totalTok)}</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-key">调用 / 命中率</span>
+        <span class="tt-val">${calls} 次 · ${formatPct(hitRate)}</span>
+      </div>
+      <div class="tt-hint">松开鼠标查看该时段详情</div>
+    `;
+    tooltipEl.classList.remove('hidden');
+    positionTooltip(tooltipEl, clientX, clientY);
+  };
+
+  const onWinMove = (evt) => {
+    if (!dragging) return;
+    const curIdx = idxFromClientX(evt.clientX);
+    dragCurIdx = curIdx;
+    if (!isBrushing && (Math.abs(evt.clientX - dragStartX) >= 5 || curIdx !== dragStartIdx)) {
+      isBrushing = true;
+      clearHover();
+    }
+    if (isBrushing) {
+      const lo = Math.min(dragStartIdx, curIdx);
+      const hi = Math.max(dragStartIdx, curIdx);
+      brushRect.setAttribute('x', String(margin.left + lo * slotW));
+      brushRect.setAttribute('width', String((hi - lo + 1) * slotW));
+      brushRect.setAttribute('opacity', '1');
+      renderBrushTooltip(lo, hi, evt.clientX, evt.clientY);
+    }
+  };
+
+  const stopDrag = () => {
+    window.removeEventListener('mousemove', onWinMove);
+    window.removeEventListener('mouseup', onWinUp);
+    dragging = false;
+    brushRect.setAttribute('opacity', '0');
+  };
+
+  const onWinUp = () => {
+    if (!dragging) return;
+    const didBrush = isBrushing;
+    const startI = dragStartIdx;
+    const endI = dragCurIdx;
+    stopDrag();
+    isBrushing = false;
+    tooltipEl.classList.add('hidden');
+    clearHover();
+
+    if (didBrush && onSelectRange) {
+      const lo = Math.min(startI, endI);
+      const hi = Math.max(startI, endI);
+      onSelectRange({
+        startItem: series[lo],
+        endItem: series[hi],
+        startIdx: lo,
+        endIdx: hi,
+        count: hi - lo + 1,
+      });
+    } else if (!didBrush && onSelectDay && series[startI]) {
+      onSelectDay(series[startI].key);
+    }
+  };
+
+  plotHit.addEventListener('mousemove', (evt) => {
+    if (dragging) return;
+    const idx = idxFromClientX(evt.clientX);
+    if (idx !== hoveredIdx) {
+      clearHover();
+      hoveredIdx = idx;
+      if (hoverBgs[idx]) hoverBgs[idx].setAttribute('opacity', '1');
+    }
+    renderSingleTooltip(idx, evt.clientX, evt.clientY);
+  });
+
+  plotHit.addEventListener('mouseleave', () => {
+    if (dragging) return;
+    clearHover();
+    tooltipEl.classList.add('hidden');
+  });
+
+  plotHit.addEventListener('mousedown', (evt) => {
+    if (evt.button !== 0) return;
+    evt.preventDefault();
+    if (!onSelectRange && !onSelectDay) return;
+    dragging = true;
+    isBrushing = false;
+    dragStartIdx = idxFromClientX(evt.clientX);
+    dragCurIdx = dragStartIdx;
+    dragStartX = evt.clientX;
+    window.addEventListener('mousemove', onWinMove);
+    window.addEventListener('mouseup', onWinUp);
+  });
+
+  container._cleanupBrush = stopDrag;
+
+  overlayGroup.appendChild(plotHit);
   svg.appendChild(barsGroup);
+  svg.appendChild(brushGroup);
   svg.appendChild(xAxisGroup);
   svg.appendChild(overlayGroup);
   container.appendChild(svg);
@@ -392,6 +564,8 @@ export function renderCacheRateChart({
       y: margin.top,
       width: slotW,
       height: plotH,
+      rx: 4,
+      ry: 4,
       fill: 'rgba(24, 24, 27, 0.045)',
       opacity: 0,
     });
@@ -400,12 +574,15 @@ export function renderCacheRateChart({
     if (item.callCount > 0) {
       const rate = Math.max(0, Math.min(1, item.cacheHitRate || 0));
       const barH = Math.max(1, rate * plotH);
+      const barRadius = barH >= 4 ? Math.min(3, barW * 0.25) : 0;
       barsGroup.appendChild(
         el('rect', {
           x: barX,
           y: margin.top + plotH - barH,
           width: barW,
           height: barH,
+          rx: barRadius || null,
+          ry: barRadius || null,
           fill: '#3b6ea5',
           opacity: 0.85,
         })
@@ -559,20 +736,22 @@ export function renderUsageHeatmap({
   startDate.setDate(endOfWeek.getDate() - weeks * 7 + 1);
 
   const rect = container.getBoundingClientRect();
-  const availW = Math.max(520, Math.floor(rect.width - 32));
+  const availW = Math.max(540, Math.floor(rect.width - 36));
   const leftPad = 24;
   const topPad = 18;
-  const gap = 3;
-  const cell = Math.max(9, Math.min(16, Math.floor((availW - leftPad - (weeks - 1) * gap) / weeks)));
+  const gap = availW >= 880 ? 4 : 3;
+  const rawCell = (availW - leftPad - 2 - (weeks - 1) * gap) / weeks;
+  const cell = Math.max(10, Math.min(20, rawCell));
+  const cellRadius = Math.min(4, Math.max(2.5, Number((cell * 0.22).toFixed(2))));
   const step = cell + gap;
 
   const gridW = weeks * step - gap;
   const gridH = 7 * step - gap;
-  const width = leftPad + gridW + 2;
-  const height = topPad + gridH + 4;
+  const width = Math.ceil(leftPad + gridW + 2);
+  const height = Math.ceil(topPad + gridH + 4);
 
   const svg = el('svg', {
-    class: 'chart-svg',
+    class: 'chart-svg heatmap-svg',
     viewBox: `0 0 ${width} ${height}`,
     width,
     height,
@@ -647,8 +826,8 @@ export function renderUsageHeatmap({
         y: topPad + d * step,
         width: cell,
         height: cell,
-        rx: 2,
-        ry: 2,
+        rx: cellRadius,
+        ry: cellRadius,
         fill: HEAT_COLORS[lvl],
         stroke: isSelected
           ? '#111113'

@@ -201,44 +201,46 @@ pub fn detect_cli_candidates() -> Vec<String> {
         );
     }
 
-    if let Some(home) = dirs::home_dir() {
-        let t3_acp_root = home
-            .join(".t3")
-            .join("tools")
-            .join("antigravity-acp")
-            .join("win32-x64");
-        let active_json = t3_acp_root.join("active.json");
-        if let Ok(raw) = fs::read_to_string(&active_json) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(rel_id) = val.get("releaseId").and_then(|v| v.as_str()) {
-                    let rel_id = rel_id.trim();
-                    if !rel_id.is_empty() {
-                        push_unique_cli_candidate(
-                            &mut candidates,
-                            &mut seen,
-                            &t3_acp_root.join("versions").join(rel_id).join("agy.exe"),
-                            &shim_dir,
-                        );
+    if crate::scanner::is_t3_code_installed() {
+        if let Some(home) = dirs::home_dir() {
+            let t3_acp_root = home
+                .join(".t3")
+                .join("tools")
+                .join("antigravity-acp")
+                .join("win32-x64");
+            let active_json = t3_acp_root.join("active.json");
+            if let Ok(raw) = fs::read_to_string(&active_json) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(rel_id) = val.get("releaseId").and_then(|v| v.as_str()) {
+                        let rel_id = rel_id.trim();
+                        if !rel_id.is_empty() {
+                            push_unique_cli_candidate(
+                                &mut candidates,
+                                &mut seen,
+                                &t3_acp_root.join("versions").join(rel_id).join("agy.exe"),
+                                &shim_dir,
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        let versions_dir = t3_acp_root.join("versions");
-        if let Ok(entries) = fs::read_dir(&versions_dir) {
-            let mut versioned: Vec<(SystemTime, PathBuf)> = Vec::new();
-            for entry in entries.flatten() {
-                let exe = entry.path().join("agy.exe");
-                if exe.is_file() {
-                    let mtime = fs::metadata(&exe)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-                    versioned.push((mtime, exe));
+            let versions_dir = t3_acp_root.join("versions");
+            if let Ok(entries) = fs::read_dir(&versions_dir) {
+                let mut versioned: Vec<(SystemTime, PathBuf)> = Vec::new();
+                for entry in entries.flatten() {
+                    let exe = entry.path().join("agy.exe");
+                    if exe.is_file() {
+                        let mtime = fs::metadata(&exe)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH);
+                        versioned.push((mtime, exe));
+                    }
                 }
-            }
-            versioned.sort_by(|a, b| b.0.cmp(&a.0));
-            for (_, exe) in versioned {
-                push_unique_cli_candidate(&mut candidates, &mut seen, &exe, &shim_dir);
+                versioned.sort_by(|a, b| b.0.cmp(&a.0));
+                for (_, exe) in versioned {
+                    push_unique_cli_candidate(&mut candidates, &mut seen, &exe, &shim_dir);
+                }
             }
         }
     }
@@ -250,8 +252,172 @@ fn default_cli_path() -> String {
     detect_cli_candidates().into_iter().next().unwrap_or_default()
 }
 
+fn parse_app_version_dir(name: &str) -> Option<Vec<u32>> {
+    let rest = name
+        .strip_prefix("app-")
+        .or_else(|| name.strip_prefix("APP-"))
+        .or_else(|| {
+            if name.len() > 4 && name[..4].eq_ignore_ascii_case("app-") {
+                Some(&name[4..])
+            } else {
+                None
+            }
+        })?;
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Option<Vec<u32>> = trimmed
+        .split('.')
+        .map(|seg| {
+            let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse::<u32>().ok()
+            }
+        })
+        .collect();
+    parts.filter(|v| !v.is_empty())
+}
+
+pub fn is_generic_app_dir(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return true;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "bin"
+            | "scripts"
+            | "system32"
+            | "syswow64"
+            | "windows"
+            | "tools"
+            | "shims"
+            | "cli-shim"
+            | "programs"
+            | "program files"
+            | "program files (x86)"
+            | "local"
+            | "roaming"
+            | "appdata"
+            | "users"
+            | "google"
+    )
+}
+
+pub fn tool_install_root(exe_path: &Path) -> Option<PathBuf> {
+    let parent = exe_path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let parent_is_versioned = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(parse_app_version_dir)
+        .is_some();
+    if parent_is_versioned {
+        if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if !is_generic_app_dir(grand) {
+                return Some(grand.to_path_buf());
+            }
+        }
+    }
+    if !is_generic_app_dir(parent) {
+        Some(parent.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// 若配置路径指向 Squirrel / NSIS 风格的根目录启动壳（同目录下存在 `app-<version>\<exe>`），
+/// 解析并返回版本号最高的真实主程序，避免启动壳丢弃 `--proxy-server` 等 Chromium 参数。
+pub fn resolve_versioned_app_exe(exe_path: &Path) -> PathBuf {
+    let Some(parent) = exe_path.parent() else {
+        return exe_path.to_path_buf();
+    };
+    let Some(file_name) = exe_path.file_name() else {
+        return exe_path.to_path_buf();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return exe_path.to_path_buf();
+    };
+
+    let mut versioned: Vec<(Vec<u32>, SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir_path = entry.path();
+        if !dir_path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(ver) = parse_app_version_dir(dir_name) else {
+            continue;
+        };
+        let candidate = dir_path.join(file_name);
+        if candidate.is_file() {
+            let mtime = fs::metadata(&candidate)
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            versioned.push((ver, mtime, candidate));
+        }
+    }
+
+    versioned.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    versioned
+        .into_iter()
+        .next()
+        .map(|(_, _, p)| p)
+        .unwrap_or_else(|| exe_path.to_path_buf())
+}
+
+fn detect_gemini_desktop_exe() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(local_app) = dirs::data_local_dir() {
+        let google_gemini = local_app.join("Google").join("Gemini");
+        candidates.push(google_gemini.join("Gemini.exe"));
+        let resolved_ver = resolve_versioned_app_exe(&google_gemini.join("Gemini.exe"));
+        if resolved_ver != google_gemini.join("Gemini.exe") {
+            candidates.push(resolved_ver);
+        }
+        candidates.push(local_app.join("Programs").join("Gemini").join("Gemini.exe"));
+        candidates.push(
+            local_app
+                .join("Programs")
+                .join("Google")
+                .join("Gemini")
+                .join("Gemini.exe"),
+        );
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        candidates.push(PathBuf::from(&pf).join("Google").join("Gemini").join("Gemini.exe"));
+        candidates.push(PathBuf::from(&pf).join("Gemini").join("Gemini.exe"));
+    }
+
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn is_gemini_desktop_tool(tool: &CliToolEntry) -> bool {
+    if tool.id == "gemini-desktop" {
+        return true;
+    }
+    let norm = normalize_path_key(&tool.exe_path);
+    norm.contains(r"\google\gemini\") && norm.ends_with(r"\gemini.exe")
+}
+
 pub fn detect_default_cli_tools() -> Vec<CliToolEntry> {
     let mut tools = Vec::new();
+
+    if let Some(exe) = detect_gemini_desktop_exe() {
+        tools.push(CliToolEntry {
+            id: "gemini-desktop".to_string(),
+            name: "Gemini Desktop".to_string(),
+            exe_path: exe.to_string_lossy().to_string(),
+            args: String::new(),
+            working_dir: String::new(),
+            is_chromium: false,
+            monitor: true,
+        });
+    }
+
     let mut t3_candidates: Vec<PathBuf> = Vec::new();
     if let Some(local_app) = dirs::data_local_dir() {
         t3_candidates.push(
@@ -429,6 +595,8 @@ pub struct ProxySettings {
     pub cli_tools: Vec<CliToolEntry>,
     #[serde(default)]
     pub cli_tools_initialized: bool,
+    #[serde(default)]
+    pub builtin_tools_discovered: Vec<String>,
 }
 
 impl Default for ProxySettings {
@@ -448,6 +616,7 @@ impl Default for ProxySettings {
             cli_path: default_cli_path(),
             cli_tools: Vec::new(),
             cli_tools_initialized: false,
+            builtin_tools_discovered: Vec::new(),
         }
     }
 }
@@ -513,16 +682,66 @@ impl ProxySettings {
                 suffix += 1;
             }
             tool.id = candidate_id;
+            if is_gemini_desktop_tool(&tool) {
+                // Gemini Desktop refuses to start when --proxy-server is passed on the command line.
+                tool.is_chromium = false;
+            }
+            // Drop stale built-in T3 Code entry if it has been uninstalled from disk.
+            if tool.id == "t3-code" && !Path::new(&tool.exe_path).is_file() {
+                continue;
+            }
             cleaned_tools.push(tool);
         }
         self.cli_tools = cleaned_tools;
 
-        if !self.cli_tools_initialized && self.cli_tools.is_empty() {
-            self.cli_tools = detect_default_cli_tools();
-            self.cli_tools_initialized = true;
-        } else if !self.cli_tools.is_empty() {
-            self.cli_tools_initialized = true;
+        let mut discovered_set: HashSet<String> = self
+            .builtin_tools_discovered
+            .iter()
+            .map(|s| slugify_tool_id(s))
+            .collect();
+        if self.cli_tools_initialized && discovered_set.is_empty() {
+            // Legacy settings from before builtin_tools_discovered existed only had t3-code as builtin.
+            discovered_set.insert("t3-code".to_string());
         }
+
+        let detected_defaults = detect_default_cli_tools();
+        if !self.cli_tools_initialized && self.cli_tools.is_empty() {
+            for tool in &detected_defaults {
+                discovered_set.insert(tool.id.clone());
+            }
+            self.cli_tools = detected_defaults;
+            self.cli_tools_initialized = true;
+        } else {
+            self.cli_tools_initialized = true;
+            let mut existing_ids: HashSet<String> =
+                self.cli_tools.iter().map(|t| t.id.clone()).collect();
+            let mut existing_paths: HashSet<String> = self
+                .cli_tools
+                .iter()
+                .map(|t| normalize_path_key(&t.exe_path))
+                .collect();
+            for tool in detected_defaults {
+                let is_new_builtin = discovered_set.insert(tool.id.clone());
+                if !is_new_builtin {
+                    continue;
+                }
+                let path_key = normalize_path_key(&tool.exe_path);
+                if !existing_ids.contains(&tool.id) && !existing_paths.contains(&path_key) {
+                    existing_ids.insert(tool.id.clone());
+                    existing_paths.insert(path_key);
+                    self.cli_tools.push(tool);
+                }
+            }
+        }
+
+        for tool in &self.cli_tools {
+            if matches!(tool.id.as_str(), "t3-code" | "gemini-desktop") {
+                discovered_set.insert(tool.id.clone());
+            }
+        }
+        let mut discovered_vec: Vec<String> = discovered_set.into_iter().collect();
+        discovered_vec.sort();
+        self.builtin_tools_discovered = discovered_vec;
         self
     }
 
@@ -650,6 +869,7 @@ pub struct ProxySnapshot {
     pub is_clash_running: bool,
     pub system_proxy_enabled: bool,
     pub system_proxy_server: String,
+    pub gemini_system_proxy_managed: bool,
     pub tun_enabled: bool,
     pub tun_adapter_text: String,
     pub antigravity_proc_count: usize,
@@ -933,6 +1153,203 @@ struct RawTcpSocket {
     state: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SavedSystemProxy {
+    pub enabled: bool,
+    pub server: Option<String>,
+    pub override_list: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedSystemProxy {
+    generation: u64,
+    previous: SavedSystemProxy,
+    proxy_server: String,
+}
+
+fn managed_system_proxy_store() -> &'static Mutex<Option<ManagedSystemProxy>> {
+    static STORE: OnceLock<Mutex<Option<ManagedSystemProxy>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(None))
+}
+
+fn next_managed_proxy_generation() -> u64 {
+    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    GEN.fetch_add(1, Ordering::SeqCst)
+}
+
+pub fn is_gemini_system_proxy_managed() -> bool {
+    managed_system_proxy_store()
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
+
+fn build_wininet_proxy_override(settings: &ProxySettings) -> String {
+    let mut entries: Vec<String> = vec![
+        "localhost".to_string(),
+        "127.*".to_string(),
+        "[::1]".to_string(),
+    ];
+    let mut seen: HashSet<String> = HashSet::new();
+
+    if settings.bypass_china_and_lan {
+        for lan in ["10.*", "172.16.*", "192.168.*", "169.254.*"] {
+            entries.push(lan.to_string());
+        }
+        for suffix in ["local", "lan", "cn"] {
+            entries.push(format!("*.{suffix}"));
+            seen.insert(suffix.to_string());
+        }
+        for domain in CHINA_DIRECT_DOMAINS {
+            if seen.insert((*domain).to_string()) {
+                entries.push((*domain).to_string());
+                entries.push(format!("*.{domain}"));
+            }
+        }
+    }
+
+    for token in settings
+        .custom_bypass_domains
+        .split(|c: char| matches!(c, ',' | ';' | '\n' | '\r' | '\t' | ' '))
+    {
+        let Some(clean) = normalize_custom_bypass_entry(token) else {
+            continue;
+        };
+        if !seen.insert(clean.clone()) {
+            continue;
+        }
+        if clean.contains('/') || clean.parse::<IpAddr>().is_ok() || clean.starts_with('[') {
+            entries.push(clean);
+        } else {
+            entries.push(clean.clone());
+            entries.push(format!("*.{clean}"));
+        }
+    }
+
+    entries.push("<local>".to_string());
+    entries.join(";")
+}
+
+fn activate_managed_system_proxy(
+    settings: &ProxySettings,
+    target_port: u16,
+    logs: &mut Vec<String>,
+) -> Option<u64> {
+    let (tun_enabled, _) = win_native::get_tun_adapter_state();
+    if tun_enabled {
+        logs.push("[i] 当前已开启 TUN 模式，无需切换 Windows 系统代理。".to_string());
+        return None;
+    }
+
+    let proxy_server = format!("{}:{}", settings.proxy_host, target_port);
+    let override_list = build_wininet_proxy_override(settings);
+
+    let mut guard = match managed_system_proxy_store().lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+
+    if let Some(existing) = guard.as_mut() {
+        let gen = next_managed_proxy_generation();
+        existing.generation = gen;
+        existing.proxy_server = proxy_server.clone();
+        if let Err(err) = win_native::set_system_proxy(true, Some(&proxy_server), Some(&override_list))
+        {
+            logs.push(format!("[!] 更新 Windows 系统代理失败: {err}"));
+        } else {
+            logs.push(format!(
+                "[OK] 已保持自动托管 Windows 系统代理 -> {proxy_server}"
+            ));
+        }
+        return Some(gen);
+    }
+
+    let previous = win_native::read_full_system_proxy();
+    if previous.enabled {
+        let srv = previous.server.as_deref().unwrap_or("已开启");
+        logs.push(format!(
+            "[i] Windows 系统代理已手动开启 ({srv})，直接复用，关闭 Gemini 时不会改动原设置。"
+        ));
+        return None;
+    }
+
+    match win_native::set_system_proxy(true, Some(&proxy_server), Some(&override_list)) {
+        Ok(()) => {
+            let gen = next_managed_proxy_generation();
+            *guard = Some(ManagedSystemProxy {
+                generation: gen,
+                previous,
+                proxy_server: proxy_server.clone(),
+            });
+            logs.push(format!(
+                "[OK] 已为 Gemini Desktop 自动开启 Windows 系统代理 -> {proxy_server}（退出 Gemini 后将自动关闭）"
+            ));
+            Some(gen)
+        }
+        Err(err) => {
+            logs.push(format!("[!] 自动开启 Windows 系统代理失败: {err}"));
+            None
+        }
+    }
+}
+
+pub fn restore_managed_system_proxy_if_active() -> Option<Result<(), String>> {
+    let managed = {
+        let Ok(mut guard) = managed_system_proxy_store().lock() else {
+            return None;
+        };
+        guard.take()
+    }?;
+    Some(win_native::restore_system_proxy(&managed.previous))
+}
+
+fn spawn_gemini_exit_watcher(exe_path: String, generation: u64) {
+    thread::spawn(move || {
+        let started = Instant::now();
+        let mut saw_running = false;
+        let mut zero_streak = 0u8;
+
+        loop {
+            thread::sleep(Duration::from_millis(1200));
+
+            let still_current = managed_system_proxy_store()
+                .lock()
+                .map(|g| g.as_ref().map(|m| m.generation == generation).unwrap_or(false))
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+
+            let running = !win_native::scan_tool_process_tree(&exe_path).is_empty();
+            if running {
+                saw_running = true;
+                zero_streak = 0;
+                continue;
+            }
+
+            if saw_running || started.elapsed() >= Duration::from_secs(6) {
+                zero_streak = zero_streak.saturating_add(1);
+                if zero_streak >= 2 {
+                    let to_restore = managed_system_proxy_store()
+                        .lock()
+                        .ok()
+                        .and_then(|mut g| {
+                            if g.as_ref().map(|m| m.generation == generation).unwrap_or(false) {
+                                g.take()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(managed) = to_restore {
+                        let _ = win_native::restore_system_proxy(&managed.previous);
+                    }
+                    return;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(windows)]
 mod win_native {
     use super::*;
@@ -965,6 +1382,8 @@ mod win_native {
     const HWND_BROADCAST: isize = 0xFFFF;
     const WM_SETTINGCHANGE: u32 = 0x001A;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    const INTERNET_OPTION_REFRESH: u32 = 37;
+    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
 
     #[link(name = "user32")]
     extern "system" {
@@ -979,15 +1398,112 @@ mod win_native {
         ) -> isize;
     }
 
+    #[link(name = "wininet")]
+    extern "system" {
+        fn InternetSetOptionW(
+            hinternet: *mut core::ffi::c_void,
+            dwoption: u32,
+            lpbuffer: *mut core::ffi::c_void,
+            dwbufferlength: u32,
+        ) -> i32;
+    }
+
+    const INTERNET_SETTINGS_SUBKEY: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    fn notify_wininet_proxy_changed() {
+        unsafe {
+            InternetSetOptionW(
+                std::ptr::null_mut(),
+                INTERNET_OPTION_SETTINGS_CHANGED,
+                std::ptr::null_mut(),
+                0,
+            );
+            InternetSetOptionW(
+                std::ptr::null_mut(),
+                INTERNET_OPTION_REFRESH,
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+    }
+
     pub fn get_system_proxy_state() -> (bool, String) {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let Ok(key) = hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-        else {
+        let Ok(key) = hkcu.open_subkey(INTERNET_SETTINGS_SUBKEY) else {
             return (false, String::new());
         };
         let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) == 1;
         let server = key.get_value::<String, _>("ProxyServer").unwrap_or_default();
         (enabled, server)
+    }
+
+    pub fn read_full_system_proxy() -> SavedSystemProxy {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let Ok(key) = hkcu.open_subkey(INTERNET_SETTINGS_SUBKEY) else {
+            return SavedSystemProxy {
+                enabled: false,
+                server: None,
+                override_list: None,
+            };
+        };
+        SavedSystemProxy {
+            enabled: key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) == 1,
+            server: key.get_value::<String, _>("ProxyServer").ok(),
+            override_list: key.get_value::<String, _>("ProxyOverride").ok(),
+        }
+    }
+
+    pub fn set_system_proxy(
+        enabled: bool,
+        server: Option<&str>,
+        override_list: Option<&str>,
+    ) -> Result<(), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey_with_flags(INTERNET_SETTINGS_SUBKEY, KEY_READ | KEY_WRITE)
+            .map_err(|e| format!("无法打开 Internet Settings 注册表键: {e}"))?;
+        let enable_val: u32 = if enabled { 1 } else { 0 };
+        key.set_value("ProxyEnable", &enable_val)
+            .map_err(|e| format!("写入 ProxyEnable 失败: {e}"))?;
+        if let Some(srv) = server {
+            key.set_value("ProxyServer", &srv)
+                .map_err(|e| format!("写入 ProxyServer 失败: {e}"))?;
+        }
+        if let Some(ov) = override_list {
+            key.set_value("ProxyOverride", &ov)
+                .map_err(|e| format!("写入 ProxyOverride 失败: {e}"))?;
+        }
+        notify_wininet_proxy_changed();
+        Ok(())
+    }
+
+    pub fn restore_system_proxy(saved: &SavedSystemProxy) -> Result<(), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey_with_flags(INTERNET_SETTINGS_SUBKEY, KEY_READ | KEY_WRITE)
+            .map_err(|e| format!("无法打开 Internet Settings 注册表键: {e}"))?;
+        let enable_val: u32 = if saved.enabled { 1 } else { 0 };
+        key.set_value("ProxyEnable", &enable_val)
+            .map_err(|e| format!("恢复 ProxyEnable 失败: {e}"))?;
+        match &saved.server {
+            Some(srv) => {
+                let _ = key.set_value("ProxyServer", srv);
+            }
+            None => {
+                let _ = key.delete_value("ProxyServer");
+            }
+        }
+        match &saved.override_list {
+            Some(ov) => {
+                let _ = key.set_value("ProxyOverride", ov);
+            }
+            None => {
+                let _ = key.delete_value("ProxyOverride");
+            }
+        }
+        notify_wininet_proxy_changed();
+        Ok(())
     }
 
     pub fn read_user_path() -> Result<(String, bool), String> {
@@ -1245,7 +1761,8 @@ mod win_native {
             .parent()
             .filter(|p| !p.as_os_str().is_empty());
 
-        let mut tool_by_stem: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut tool_by_stem: HashMap<String, Vec<(String, String, Option<PathBuf>)>> =
+            HashMap::new();
         for tool in &settings.cli_tools {
             if !tool.monitor {
                 continue;
@@ -1254,7 +1771,8 @@ mod win_native {
             if exe_norm.is_empty() {
                 continue;
             }
-            let stem_lower = Path::new(tool.exe_path.trim())
+            let exe_path = Path::new(tool.exe_path.trim());
+            let stem_lower = exe_path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
@@ -1262,10 +1780,11 @@ mod win_native {
             if stem_lower.is_empty() {
                 continue;
             }
+            let root = tool_install_root(exe_path);
             tool_by_stem
                 .entry(stem_lower)
                 .or_default()
-                .push((tool.id.clone(), exe_norm));
+                .push((tool.id.clone(), exe_norm, root));
         }
 
         let snapshot = collect_process_snapshot();
@@ -1313,9 +1832,14 @@ mod win_native {
             if let Some(candidates) = tool_by_stem.get(&p.stem_lower) {
                 if let Some(full_path) = query_process_image_path(p.pid) {
                     let full_norm = normalize_path_key(&full_path);
-                    if let Some((tool_id, _)) =
-                        candidates.iter().find(|(_, exe_norm)| *exe_norm == full_norm)
-                    {
+                    let full_path_ref = Path::new(&full_path);
+                    if let Some((tool_id, _, _)) = candidates.iter().find(|(_, exe_norm, root)| {
+                        *exe_norm == full_norm
+                            || root
+                                .as_deref()
+                                .map(|dir| is_inside_dir(full_path_ref, dir))
+                                .unwrap_or(false)
+                    }) {
                         *tool_counts.entry(tool_id.clone()).or_insert(0) += 1;
                         procs.push(ProcessEntry {
                             pid: p.pid,
@@ -1347,28 +1871,6 @@ mod win_native {
         procs
     }
 
-    fn is_generic_bin_dir(dir: &Path) -> bool {
-        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-            return true;
-        };
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "bin"
-                | "scripts"
-                | "system32"
-                | "syswow64"
-                | "windows"
-                | "tools"
-                | "shims"
-                | "cli-shim"
-                | "programs"
-                | "local"
-                | "roaming"
-                | "appdata"
-                | "users"
-        )
-    }
-
     pub fn scan_tool_process_tree(exe_path: &str) -> Vec<ProcessEntry> {
         let target_norm = normalize_path_key(exe_path);
         if target_norm.is_empty() {
@@ -1383,8 +1885,8 @@ mod win_native {
         if target_stem_lower.is_empty() {
             return Vec::new();
         }
-        let target_parent = target_path.parent().filter(|p| !p.as_os_str().is_empty());
-        let allow_dir_children = target_parent.map(|d| !is_generic_bin_dir(d)).unwrap_or(false);
+        let install_root = tool_install_root(target_path);
+        let allow_dir_children = install_root.is_some();
 
         let snapshot = collect_process_snapshot();
         let mut matched_pids = HashSet::new();
@@ -1393,7 +1895,12 @@ mod win_native {
         for p in &snapshot {
             if p.stem_lower == target_stem_lower {
                 if let Some(full_path) = query_process_image_path(p.pid) {
-                    if normalize_path_key(&full_path) == target_norm && matched_pids.insert(p.pid) {
+                    let exact = normalize_path_key(&full_path) == target_norm;
+                    let inside_root = install_root
+                        .as_deref()
+                        .map(|dir| is_inside_dir(Path::new(&full_path), dir))
+                        .unwrap_or(false);
+                    if (exact || inside_root) && matched_pids.insert(p.pid) {
                         procs.push(ProcessEntry {
                             pid: p.pid,
                             name: p.stem.clone(),
@@ -1419,7 +1926,8 @@ mod win_native {
                 let is_ls = p.stem_lower.starts_with("language_server");
                 let same_stem = p.stem_lower == target_stem_lower;
                 let inside_tool_dir = if !same_stem && !is_cli && !is_ls && allow_dir_children {
-                    target_parent
+                    install_root
+                        .as_deref()
                         .zip(query_process_image_path(p.pid))
                         .map(|(dir, fp)| is_inside_dir(Path::new(&fp), dir))
                         .unwrap_or(false)
@@ -1615,6 +2123,23 @@ mod win_native {
     pub fn get_system_proxy_state() -> (bool, String) {
         (false, String::new())
     }
+    pub fn read_full_system_proxy() -> SavedSystemProxy {
+        SavedSystemProxy {
+            enabled: false,
+            server: None,
+            override_list: None,
+        }
+    }
+    pub fn set_system_proxy(
+        _enabled: bool,
+        _server: Option<&str>,
+        _override_list: Option<&str>,
+    ) -> Result<(), String> {
+        Err("仅支持 Windows".to_string())
+    }
+    pub fn restore_system_proxy(_saved: &SavedSystemProxy) -> Result<(), String> {
+        Ok(())
+    }
     pub fn read_user_path() -> Result<(String, bool), String> {
         Ok((String::new(), true))
     }
@@ -1740,6 +2265,7 @@ pub fn build_snapshot(settings: &ProxySettings) -> ProxySnapshot {
         is_clash_running: clash_running,
         system_proxy_enabled: sys_proxy_enabled,
         system_proxy_server: sys_proxy_server,
+        gemini_system_proxy_managed: is_gemini_system_proxy_managed(),
         tun_enabled,
         tun_adapter_text,
         antigravity_proc_count: agy_count,
@@ -1894,13 +2420,35 @@ pub fn stop_antigravity_processes(antigravity_path: &str) -> (bool, Vec<String>)
     )
 }
 
-pub fn stop_cli_tool_processes(exe_path: &str, tool_name: &str) -> (bool, Vec<String>) {
-    stop_processes_with(
+fn is_gemini_desktop_path(exe_path: &str) -> bool {
+    let norm = normalize_path_key(exe_path);
+    norm.contains(r"\google\gemini\") && norm.ends_with(r"\gemini.exe")
+}
+
+fn stop_cli_tool_processes_inner(
+    exe_path: &str,
+    tool_name: &str,
+    restore_managed_proxy: bool,
+) -> (bool, Vec<String>) {
+    let (ok, mut logs) = stop_processes_with(
         || win_native::scan_tool_process_tree(exe_path),
         &format!("[i] 当前没有正在运行的 {tool_name} 进程。"),
         &format!(" {tool_name} 相关进程"),
         &format!("[OK] 所有旧 {tool_name} 相关进程已退出。"),
-    )
+    );
+    if restore_managed_proxy && is_gemini_desktop_path(exe_path) {
+        if let Some(res) = restore_managed_system_proxy_if_active() {
+            match res {
+                Ok(()) => logs.push("[OK] 已自动关闭 Windows 系统代理（恢复启动前状态）。".to_string()),
+                Err(err) => logs.push(format!("[!] 自动恢复 Windows 系统代理失败: {err}")),
+            }
+        }
+    }
+    (ok, logs)
+}
+
+pub fn stop_cli_tool_processes(exe_path: &str, tool_name: &str) -> (bool, Vec<String>) {
+    stop_cli_tool_processes_inner(exe_path, tool_name, true)
 }
 
 pub fn stop_cli_processes() -> (bool, Vec<String>) {
@@ -2678,7 +3226,7 @@ pub fn launch_isolated_cli_tool(
                 error: None,
             };
         }
-        let (stopped, stop_logs) = stop_cli_tool_processes(&tool.exe_path, &tool.name);
+        let (stopped, stop_logs) = stop_cli_tool_processes_inner(&tool.exe_path, &tool.name, false);
         logs.extend(stop_logs);
         if !stopped {
             return ActionResponse {
@@ -2696,27 +3244,44 @@ pub fn launch_isolated_cli_tool(
     }
 
     let proxy_url = format!("http://{}:{}", settings.proxy_host, target_port);
-    let ext_lower = exe_path
+    let launch_exe = resolve_versioned_app_exe(exe_path);
+    if normalize_path_key(&launch_exe.to_string_lossy()) != normalize_path_key(tool.exe_path.trim()) {
+        logs.push(format!(
+            "[i] 已解析版本化主程序: {}",
+            launch_exe.to_string_lossy()
+        ));
+    }
+
+    let ext_lower = launch_exe
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     let mut cmd = if ext_lower == "cmd" || ext_lower == "bat" {
         let mut c = Command::new("cmd.exe");
-        c.args(["/C", tool.exe_path.trim()]);
+        c.args(["/C", &launch_exe.to_string_lossy()]);
         c
     } else {
-        Command::new(exe_path)
+        Command::new(&launch_exe)
     };
 
     let work_dir = tool.working_dir.trim();
     if !work_dir.is_empty() && Path::new(work_dir).is_dir() {
         cmd.current_dir(work_dir);
-    } else if let Some(dir) = exe_path.parent() {
+    } else if let Some(dir) = launch_exe.parent() {
         cmd.current_dir(dir);
     }
 
-    if tool.is_chromium {
+    let is_gemini = is_gemini_desktop_tool(tool);
+    let use_chromium_flags = tool.is_chromium && !is_gemini;
+
+    let managed_gen = if is_gemini {
+        activate_managed_system_proxy(settings, target_port, &mut logs)
+    } else {
+        None
+    };
+
+    if use_chromium_flags {
         apply_proxy_env_and_args(&mut cmd, settings, &proxy_url);
         if settings.disable_quic {
             cmd.arg("--disable-quic");
@@ -2730,19 +3295,52 @@ pub fn launch_isolated_cli_tool(
     }
 
     match cmd.spawn() {
-        Ok(child) => {
-            let mode_tag = if tool.is_chromium {
-                "Chromium + 环境变量"
+        Ok(mut child) => {
+            let pid = child.id();
+            thread::sleep(Duration::from_millis(300));
+            if let Ok(Some(status)) = child.try_wait() {
+                if !status.success() {
+                    if managed_gen.is_some() {
+                        let _ = restore_managed_system_proxy_if_active();
+                    }
+                    let code = status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "未知".to_string());
+                    let msg = format!(
+                        "{} 启动后立即退出 (PID {}, 退出码 {})，请检查程序日志或启动参数。",
+                        tool.name, pid, code
+                    );
+                    logs.push(format!("[X] {msg}"));
+                    return ActionResponse {
+                        ok: false,
+                        need_confirm: false,
+                        process_count: 0,
+                        resolved_port: target_port,
+                        logs,
+                        error: Some(msg),
+                    };
+                }
+            }
+            if let Some(gen) = managed_gen {
+                spawn_gemini_exit_watcher(tool.exe_path.clone(), gen);
+            }
+            if is_gemini {
+                logs.push(format!(
+                    "[OK] {} 已启动 (PID {})，已纳入进程与连接监控。",
+                    tool.name, pid
+                ));
             } else {
-                "环境变量隔离"
-            };
-            logs.push(format!(
-                "[OK] {} 已以独立代理启动 (PID {}, {}) -> {}（子进程 agy CLI 将自动继承代理）",
-                tool.name,
-                child.id(),
-                mode_tag,
-                proxy_url
-            ));
+                let mode_tag = if use_chromium_flags {
+                    "Chromium + 环境变量"
+                } else {
+                    "环境变量隔离"
+                };
+                logs.push(format!(
+                    "[OK] {} 已以独立代理启动 (PID {}, {}) -> {}",
+                    tool.name, pid, mode_tag, proxy_url
+                ));
+            }
             ActionResponse {
                 ok: true,
                 need_confirm: false,
@@ -2753,6 +3351,9 @@ pub fn launch_isolated_cli_tool(
             }
         }
         Err(err) => {
+            if managed_gen.is_some() {
+                let _ = restore_managed_system_proxy_if_active();
+            }
             let msg = format!("启动 {} 失败: {err}", tool.name);
             logs.push(format!("[X] {msg}"));
             ActionResponse {
@@ -3417,7 +4018,7 @@ pub fn build_dry_run_preview(settings: &ProxySettings, proxy_port: u16) -> Strin
         format!("  CLI 路径   : {cli_display}"),
         format!("  CLI Shim   : {shim_display}"),
         format!(
-            "  CLI 工具   : {} 项 ({tools_display})",
+            "  独立应用   : {} 项 ({tools_display})",
             settings.cli_tools.len()
         ),
         format!("  国内/内网直连: {bypass_summary}"),
@@ -3955,5 +4556,88 @@ mod tests {
         assert!(!parsed.cli_tools_initialized);
         let sanitized = parsed.sanitized();
         assert!(sanitized.cli_tools_initialized);
+    }
+
+    #[test]
+    fn resolves_highest_versioned_app_exe_and_install_root() {
+        let unique = format!(
+            "agydock_ver_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let v1 = root.join("app-1.9.2");
+        let v2 = root.join("app-1.21.1");
+        let v3 = root.join("app-1.20.9");
+        fs::create_dir_all(&v1).unwrap();
+        fs::create_dir_all(&v2).unwrap();
+        fs::create_dir_all(&v3).unwrap();
+
+        let stub = root.join("Gemini.exe");
+        let exe1 = v1.join("Gemini.exe");
+        let exe2 = v2.join("Gemini.exe");
+        let exe3 = v3.join("Gemini.exe");
+        fs::write(&stub, b"stub").unwrap();
+        fs::write(&exe1, b"v1").unwrap();
+        fs::write(&exe2, b"v2").unwrap();
+        fs::write(&exe3, b"v3").unwrap();
+
+        let resolved = resolve_versioned_app_exe(&stub);
+        assert_eq!(resolved, exe2);
+
+        let root_from_stub = tool_install_root(&stub).unwrap();
+        let root_from_ver = tool_install_root(&exe2).unwrap();
+        assert_eq!(root_from_stub, root);
+        assert_eq!(root_from_ver, root);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parses_app_version_dir_names() {
+        assert_eq!(parse_app_version_dir("app-1.21.1"), Some(vec![1, 21, 1]));
+        assert_eq!(parse_app_version_dir("APP-2.0.3-beta"), Some(vec![2, 0, 3]));
+        assert_eq!(parse_app_version_dir("Crashpad"), None);
+        assert_eq!(parse_app_version_dir("app-"), None);
+    }
+
+    #[test]
+    fn forces_gemini_desktop_off_chromium_proxy_flags() {
+        let mut s = ProxySettings::default();
+        s.cli_tools_initialized = true;
+        s.builtin_tools_discovered = vec!["gemini-desktop".to_string(), "t3-code".to_string()];
+        s.cli_tools = vec![CliToolEntry {
+            id: "gemini-desktop".to_string(),
+            name: "Gemini Desktop".to_string(),
+            exe_path: r"C:\Users\alice\AppData\Local\Google\Gemini\Gemini.exe".to_string(),
+            args: String::new(),
+            working_dir: String::new(),
+            is_chromium: true,
+            monitor: true,
+        }];
+        let sanitized = s.sanitized();
+        let gemini = sanitized
+            .cli_tools
+            .iter()
+            .find(|t| t.id == "gemini-desktop")
+            .unwrap();
+        assert!(!gemini.is_chromium);
+    }
+
+    #[test]
+    fn builds_wininet_proxy_override_with_local_and_china_rules() {
+        let mut s = ProxySettings::default();
+        s.bypass_china_and_lan = true;
+        s.custom_bypass_domains = "internal.corp".to_string();
+        let ov = build_wininet_proxy_override(&s);
+        assert!(ov.contains("localhost"));
+        assert!(ov.contains("127.*"));
+        assert!(ov.contains("192.168.*"));
+        assert!(ov.contains("*.cn"));
+        assert!(ov.contains("*.internal.corp"));
+        assert!(ov.ends_with("<local>"));
     }
 }

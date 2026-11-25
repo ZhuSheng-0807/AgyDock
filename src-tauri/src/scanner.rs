@@ -95,72 +95,174 @@ pub fn infer_source_from_dir(dir: &Path) -> (String, String) {
     if norm.contains("/antigravity-acp/") || norm.ends_with("/antigravity-acp/brain") {
         ("t3".to_string(), "T3 Code".to_string())
     } else if norm.contains("/antigravity-cli/") || norm.ends_with("/antigravity-cli/brain") {
-        ("cli".to_string(), "agy CLI".to_string())
+        ("cli".to_string(), "CLI".to_string())
     } else if norm.contains("/.gemini/antigravity/") || norm.ends_with("/antigravity/brain") {
-        ("app".to_string(), "Antigravity App".to_string())
+        ("app".to_string(), "Antigravity".to_string())
     } else {
         ("custom".to_string(), "自定义目录".to_string())
     }
 }
 
-pub fn discover_brain_sources_from_home(home: Option<&Path>) -> Vec<BrainSourceSpec> {
+pub fn is_antigravity_installed() -> bool {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(local_app) = dirs::data_local_dir() {
+        candidates.push(local_app.join("Programs").join("antigravity").join("Antigravity.exe"));
+        candidates.push(local_app.join("Programs").join("Antigravity").join("Antigravity.exe"));
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        candidates.push(PathBuf::from(&pf).join("Antigravity").join("Antigravity.exe"));
+    }
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from("/Applications/Antigravity.app"));
+
+    candidates.into_iter().any(|p| p.exists())
+}
+
+pub fn is_t3_code_installed() -> bool {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(local_app) = dirs::data_local_dir() {
+        candidates.push(
+            local_app
+                .join("Programs")
+                .join("t3code")
+                .join("T3 Code (Beta).exe"),
+        );
+        candidates.push(local_app.join("Programs").join("t3code").join("T3 Code.exe"));
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        candidates.push(PathBuf::from(&pf).join("T3 Code").join("T3 Code.exe"));
+        candidates.push(PathBuf::from(&pf).join("T3 Code").join("T3 Code (Beta).exe"));
+    }
+    candidates.into_iter().any(|p| p.is_file())
+}
+
+pub fn is_agy_cli_installed() -> bool {
+    let shim_dir_lower = dirs::data_local_dir()
+        .or_else(dirs::config_dir)
+        .map(|d| d.join("AgyDock").join("cli-shim").to_string_lossy().to_lowercase());
+
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let dir_lower = dir.to_string_lossy().to_lowercase();
+            if shim_dir_lower
+                .as_deref()
+                .map(|s| dir_lower.trim_end_matches(['\\', '/']) == s.trim_end_matches(['\\', '/']))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if dir.join("agy.exe").is_file()
+                || dir.join("antigravity-cli.exe").is_file()
+                || dir.join("agy").is_file()
+            {
+                return true;
+            }
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        if home.join(".local").join("bin").join("agy.exe").is_file()
+            || home.join(".local").join("bin").join("agy").is_file()
+            || home.join(".antigravity").join("bin").join("agy.exe").is_file()
+            || home.join(".antigravity").join("bin").join("agy").is_file()
+        {
+            return true;
+        }
+    }
+
+    if let Some(local_app) = dirs::data_local_dir() {
+        if local_app
+            .join("Programs")
+            .join("antigravity-cli")
+            .join("agy.exe")
+            .is_file()
+            || local_app.join("antigravity").join("agy.exe").is_file()
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn discover_brain_sources_from_home_filtered(
+    home: Option<&Path>,
+    include_app: bool,
+    include_cli: bool,
+    include_t3: bool,
+) -> Vec<BrainSourceSpec> {
     let mut sources = Vec::new();
     let Some(h) = home else {
-        sources.push(BrainSourceSpec {
-            id: "app".to_string(),
-            label: "Antigravity App".to_string(),
-            dir: PathBuf::from(".gemini").join("antigravity").join("brain"),
-        });
-        sources.push(BrainSourceSpec {
-            id: "cli".to_string(),
-            label: "agy CLI".to_string(),
-            dir: PathBuf::from(".gemini").join("antigravity-cli").join("brain"),
-        });
+        if include_app {
+            sources.push(BrainSourceSpec {
+                id: "app".to_string(),
+                label: "Antigravity".to_string(),
+                dir: PathBuf::from(".gemini").join("antigravity").join("brain"),
+            });
+        }
+        if include_cli {
+            sources.push(BrainSourceSpec {
+                id: "cli".to_string(),
+                label: "CLI".to_string(),
+                dir: PathBuf::from(".gemini").join("antigravity-cli").join("brain"),
+            });
+        }
         return sources;
     };
 
-    sources.push(BrainSourceSpec {
-        id: "app".to_string(),
-        label: "Antigravity App".to_string(),
-        dir: h.join(".gemini").join("antigravity").join("brain"),
-    });
-    sources.push(BrainSourceSpec {
-        id: "cli".to_string(),
-        label: "agy CLI".to_string(),
-        dir: h.join(".gemini").join("antigravity-cli").join("brain"),
-    });
+    if include_app {
+        sources.push(BrainSourceSpec {
+            id: "app".to_string(),
+            label: "Antigravity".to_string(),
+            dir: h.join(".gemini").join("antigravity").join("brain"),
+        });
+    }
+    if include_cli {
+        sources.push(BrainSourceSpec {
+            id: "cli".to_string(),
+            label: "CLI".to_string(),
+            dir: h.join(".gemini").join("antigravity-cli").join("brain"),
+        });
+    }
 
-    let t3_root = h
-        .join(".t3")
-        .join("userdata")
-        .join("providers")
-        .join("antigravity");
-    if let Ok(entries) = fs::read_dir(&t3_root) {
-        let mut subdirs: Vec<PathBuf> = entries
-            .flatten()
-            .filter_map(|e| {
-                let p = e.path();
-                if p.is_dir() {
-                    Some(p)
-                } else {
-                    None
+    if include_t3 {
+        let t3_root = h
+            .join(".t3")
+            .join("userdata")
+            .join("providers")
+            .join("antigravity");
+        if let Ok(entries) = fs::read_dir(&t3_root) {
+            let mut subdirs: Vec<PathBuf> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            subdirs.sort();
+            for sub in subdirs {
+                let acp_brain = sub.join("antigravity-acp").join("brain");
+                if acp_brain.is_dir() {
+                    sources.push(BrainSourceSpec {
+                        id: "t3".to_string(),
+                        label: "T3 Code".to_string(),
+                        dir: acp_brain,
+                    });
                 }
-            })
-            .collect();
-        subdirs.sort();
-        for sub in subdirs {
-            let acp_brain = sub.join("antigravity-acp").join("brain");
-            if acp_brain.is_dir() {
-                sources.push(BrainSourceSpec {
-                    id: "t3".to_string(),
-                    label: "T3 Code".to_string(),
-                    dir: acp_brain,
-                });
             }
         }
     }
 
     sources
+}
+
+#[cfg(test)]
+pub fn discover_brain_sources_from_home(home: Option<&Path>) -> Vec<BrainSourceSpec> {
+    discover_brain_sources_from_home_filtered(home, true, true, true)
 }
 
 pub fn discover_default_brain_sources() -> Vec<BrainSourceSpec> {
@@ -173,7 +275,27 @@ pub fn discover_default_brain_sources() -> Vec<BrainSourceSpec> {
         }
     }
     let home = dirs::home_dir();
-    discover_brain_sources_from_home(home.as_deref())
+    let app_installed = is_antigravity_installed();
+    let cli_installed = is_agy_cli_installed();
+    let t3_installed = is_t3_code_installed();
+
+    let mut sources = discover_brain_sources_from_home_filtered(
+        home.as_deref(),
+        app_installed,
+        cli_installed,
+        t3_installed,
+    );
+
+    // Fallback: if no known install path matched (e.g., portable Antigravity install),
+    // still scan Antigravity's default brain dir if present.
+    if sources.is_empty() {
+        let fallback = discover_brain_sources_from_home_filtered(home.as_deref(), true, false, false);
+        if fallback.iter().any(|s| s.dir.is_dir()) {
+            sources = fallback;
+        }
+    }
+
+    sources
 }
 
 pub fn get_default_brain_dir() -> PathBuf {
@@ -617,7 +739,7 @@ pub fn parse_transcript_text(text: &str, session_id: &str) -> ParsedSession {
     ParsedSession {
         id: session_id.to_string(),
         source: "app".to_string(),
-        source_label: "Antigravity App".to_string(),
+        source_label: "Antigravity".to_string(),
         title: fallback_title,
         has_user_input,
         system_sender_id,
@@ -1135,6 +1257,10 @@ pub struct UsageMeta {
     pub available_models: Vec<String>,
     pub available_days: Vec<String>,
     pub selected_day: Option<String>,
+    pub selected_start_day: Option<String>,
+    pub selected_end_day: Option<String>,
+    pub selected_start_ts: Option<i64>,
+    pub selected_end_ts: Option<i64>,
     pub range: String,
     pub granularity: String,
     pub model_filter: String,
@@ -1355,6 +1481,38 @@ fn format_local_day_key(ms: i64) -> String {
     format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
 }
 
+fn parse_local_day_range(
+    start_opt: Option<&str>,
+    end_opt: Option<&str>,
+) -> Option<(String, String, DateTime<Local>, DateTime<Local>)> {
+    let s_raw = start_opt?.trim();
+    let e_raw = end_opt?.trim();
+    if s_raw.len() != 10 || e_raw.len() != 10 {
+        return None;
+    }
+    let d1 = NaiveDate::parse_from_str(s_raw, "%Y-%m-%d").ok()?;
+    let d2 = NaiveDate::parse_from_str(e_raw, "%Y-%m-%d").ok()?;
+    let (start_date, end_date) = if d1 <= d2 { (d1, d2) } else { (d2, d1) };
+    let next_after_end = end_date.succ_opt()?;
+    let start_dt = local_midnight(start_date)?;
+    let end_dt = local_midnight(next_after_end)?;
+    Some((
+        start_date.format("%Y-%m-%d").to_string(),
+        end_date.format("%Y-%m-%d").to_string(),
+        start_dt,
+        end_dt,
+    ))
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AggregateRangeFilter<'a> {
+    pub start_day: Option<&'a str>,
+    pub end_day: Option<&'a str>,
+    pub start_ts: Option<i64>,
+    pub end_ts: Option<i64>,
+}
+
+#[cfg(test)]
 pub fn aggregate_usage(
     scan_result: &ScanResult,
     range_opt: Option<&str>,
@@ -1364,9 +1522,48 @@ pub fn aggregate_usage(
     day_opt: Option<&str>,
     now_override: Option<i64>,
 ) -> UsageResponse {
+    aggregate_usage_with_filter(
+        scan_result,
+        range_opt,
+        granularity_opt,
+        model_opt,
+        source_opt,
+        day_opt,
+        AggregateRangeFilter::default(),
+        now_override,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn aggregate_usage_with_filter(
+    scan_result: &ScanResult,
+    range_opt: Option<&str>,
+    granularity_opt: Option<&str>,
+    model_opt: Option<&str>,
+    source_opt: Option<&str>,
+    day_opt: Option<&str>,
+    custom_filter: AggregateRangeFilter<'_>,
+    now_override: Option<i64>,
+) -> UsageResponse {
     let now = now_override.unwrap_or_else(now_ms);
-    let day_bounds = parse_local_day_bounds(day_opt);
-    let range = if day_bounds.is_some() {
+    let ts_window = match (custom_filter.start_ts, custom_filter.end_ts) {
+        (Some(a), Some(b)) if b > a => Some((a, b)),
+        _ => None,
+    };
+    let day_range_bounds = if ts_window.is_none() {
+        parse_local_day_range(custom_filter.start_day, custom_filter.end_day)
+    } else {
+        None
+    };
+    let day_bounds = if ts_window.is_none() && day_range_bounds.is_none() {
+        parse_local_day_bounds(day_opt)
+    } else {
+        None
+    };
+
+    let range = if ts_window.is_some() || day_range_bounds.is_some() {
+        "custom"
+    } else if day_bounds.is_some() {
         "day"
     } else {
         match range_opt.unwrap_or("7d") {
@@ -1377,7 +1574,24 @@ pub fn aggregate_usage(
             _ => "7d",
         }
     };
-    let granularity = if day_bounds.is_some() {
+    let granularity = if ts_window.is_some() {
+        match granularity_opt {
+            Some("day") => "day",
+            _ => "hour",
+        }
+    } else if let Some((ref sd, ref ed, _, _)) = day_range_bounds {
+        match granularity_opt {
+            Some("hour") => "hour",
+            Some("day") => "day",
+            _ => {
+                if sd == ed {
+                    "hour"
+                } else {
+                    "day"
+                }
+            }
+        }
+    } else if day_bounds.is_some() {
         "hour"
     } else {
         match granularity_opt {
@@ -1396,7 +1610,11 @@ pub fn aggregate_usage(
     let source_filter = source_opt.filter(|s| !s.is_empty() && *s != "all");
 
     let (range_start, range_end): (Option<i64>, Option<i64>) =
-        if let Some((_, ref start_dt, ref end_dt)) = day_bounds {
+        if let Some((st, et)) = ts_window {
+            (Some(st), Some(et))
+        } else if let Some((_, _, ref start_dt, ref end_dt)) = day_range_bounds {
+            (Some(start_dt.timestamp_millis()), Some(end_dt.timestamp_millis()))
+        } else if let Some((_, ref start_dt, ref end_dt)) = day_bounds {
             (Some(start_dt.timestamp_millis()), Some(end_dt.timestamp_millis()))
         } else {
             let rs = match range {
@@ -1704,7 +1922,21 @@ pub fn aggregate_usage(
 
     // Build continuous local-time series
     let mut timeline_end = bucket_start_local(now, granularity);
-    let mut timeline_start = if let Some((_, ref start_dt, _)) = day_bounds {
+    let mut timeline_start = if let Some((st, et)) = ts_window {
+        timeline_end = bucket_start_local(et.saturating_sub(1).max(st), granularity);
+        bucket_start_local(st, granularity)
+    } else if let Some((_, _, ref start_dt, ref end_dt)) = day_range_bounds {
+        let last_ms = end_dt.timestamp_millis().saturating_sub(1);
+        timeline_end = bucket_start_local(last_ms, granularity);
+        let mut s = bucket_start_local(start_dt.timestamp_millis(), granularity);
+        if granularity == "hour" {
+            let min_allowed = timeline_end - Duration::hours(167);
+            if s < min_allowed {
+                s = min_allowed;
+            }
+        }
+        s
+    } else if let Some((_, ref start_dt, _)) = day_bounds {
         timeline_end = *start_dt + Duration::hours(23);
         *start_dt
     } else if let Some(rs) = range_start {
@@ -1825,6 +2057,10 @@ pub fn aggregate_usage(
             available_models: all_models.into_iter().collect(),
             available_days: available_days.into_iter().collect(),
             selected_day: day_bounds.map(|(k, _, _)| k),
+            selected_start_day: day_range_bounds.as_ref().map(|(s, _, _, _)| s.clone()),
+            selected_end_day: day_range_bounds.as_ref().map(|(_, e, _, _)| e.clone()),
+            selected_start_ts: ts_window.map(|(s, _)| s),
+            selected_end_ts: ts_window.map(|(_, e)| e),
             range: range.to_string(),
             granularity: granularity.to_string(),
             model_filter: model_filter.unwrap_or("all").to_string(),
@@ -2081,6 +2317,34 @@ mod tests {
         let csv = build_sessions_csv(&agg_t3.sessions);
         assert!(csv.starts_with("\u{FEFF}session_id,source,"));
         assert!(csv.contains("T3 Code"));
+
+        // Filtered discovery excludes uninstalled sources
+        let only_app = discover_brain_sources_from_home_filtered(Some(&tmp), true, false, false);
+        assert_eq!(only_app.len(), 1);
+        assert_eq!(only_app[0].id, "app");
+        assert_eq!(only_app[0].label, "Antigravity");
+
+        // Custom date range and timestamp window filtering
+        let agg_custom = aggregate_usage_with_filter(
+            &scan_res,
+            Some("custom"),
+            Some("day"),
+            None,
+            None,
+            None,
+            AggregateRangeFilter {
+                start_day: Some("2026-11-23"),
+                end_day: Some("2026-11-25"),
+                start_ts: None,
+                end_ts: None,
+            },
+            None,
+        );
+        assert_eq!(agg_custom.meta.range, "custom");
+        assert_eq!(agg_custom.meta.selected_start_day.as_deref(), Some("2026-11-23"));
+        assert_eq!(agg_custom.meta.selected_end_day.as_deref(), Some("2026-11-25"));
+        assert_eq!(agg_custom.series.len(), 3);
+        assert_eq!(agg_custom.summary.session_count, 3);
 
         let _ = fs::remove_dir_all(&tmp);
     }

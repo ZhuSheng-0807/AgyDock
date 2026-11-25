@@ -439,6 +439,26 @@ test('strips T3 Code bootstrap wrappers and aggregates/filters multi-source brai
     const csv = buildSessionsCsv(t3Data.sessions);
     assert.ok(csv.startsWith('\uFEFFsession_id,source,'));
     assert.ok(csv.includes('T3 Code'));
+
+    const filteredSources = await discoverDefaultBrainSources(tmpHome, {
+      includeApp: true,
+      includeCli: false,
+      includeT3: false,
+    });
+    assert.equal(filteredSources.length, 1);
+    assert.equal(filteredSources[0].label, 'Antigravity');
+
+    const customRangeRes = await invokeHandler(
+      handler,
+      '/api/usage?range=custom&startDay=2026-11-23&endDay=2026-11-25'
+    );
+    assert.equal(customRangeRes.status, 200);
+    const customRangeData = JSON.parse(customRangeRes.body);
+    assert.equal(customRangeData.meta.range, 'custom');
+    assert.equal(customRangeData.meta.selectedStartDay, '2026-11-23');
+    assert.equal(customRangeData.meta.selectedEndDay, '2026-11-25');
+    assert.equal(customRangeData.series.length, 3);
+    assert.equal(customRangeData.summary.sessionCount, 3);
   } finally {
     await fs.rm(tmpHome, { recursive: true, force: true });
   }

@@ -106,12 +106,18 @@ export function createRequestHandler({ brainDir, sources, autoDiscover } = {}) {
 
       if (pathname === '/api/usage') {
         const scanResult = await scanner.scan();
+        const startTsRaw = url.searchParams.get('startTs');
+        const endTsRaw = url.searchParams.get('endTs');
         const data = aggregateUsage(scanResult, {
           range: url.searchParams.get('range') || '7d',
           granularity: url.searchParams.get('granularity') || undefined,
           model: url.searchParams.get('model') || 'all',
           source: url.searchParams.get('source') || 'all',
           day: url.searchParams.get('day') || undefined,
+          startDay: url.searchParams.get('startDay') || undefined,
+          endDay: url.searchParams.get('endDay') || undefined,
+          startTs: startTsRaw !== null ? Number(startTsRaw) : undefined,
+          endTs: endTsRaw !== null ? Number(endTsRaw) : undefined,
         });
         sendJson(res, 200, data);
         return;
@@ -133,7 +139,7 @@ export function createRequestHandler({ brainDir, sources, autoDiscover } = {}) {
         sendJson(res, 200, {
           id: session.id,
           source: session.source || 'app',
-          sourceLabel: session.sourceLabel || 'Antigravity App',
+          sourceLabel: session.sourceLabel || 'Antigravity',
           title: session.title,
           startedAt: session.startedAt,
           lastAt: session.lastAt,
@@ -144,15 +150,24 @@ export function createRequestHandler({ brainDir, sources, autoDiscover } = {}) {
 
       if (pathname === '/api/export.csv') {
         const scanResult = await scanner.scan();
+        const startTsRaw = url.searchParams.get('startTs');
+        const endTsRaw = url.searchParams.get('endTs');
         const data = aggregateUsage(scanResult, {
           range: url.searchParams.get('range') || '7d',
           granularity: url.searchParams.get('granularity') || undefined,
           model: url.searchParams.get('model') || 'all',
           source: url.searchParams.get('source') || 'all',
           day: url.searchParams.get('day') || undefined,
+          startDay: url.searchParams.get('startDay') || undefined,
+          endDay: url.searchParams.get('endDay') || undefined,
+          startTs: startTsRaw !== null ? Number(startTsRaw) : undefined,
+          endTs: endTsRaw !== null ? Number(endTsRaw) : undefined,
         });
         const csv = buildSessionsCsv(data.sessions);
-        const suffix = data.meta.selectedDay || data.meta.range;
+        const suffix =
+          data.meta.selectedStartDay && data.meta.selectedEndDay
+            ? `${data.meta.selectedStartDay}_to_${data.meta.selectedEndDay}`
+            : data.meta.selectedDay || data.meta.range;
         const filename = `antigravity-usage-${suffix}.csv`;
         res.writeHead(200, {
           'Content-Type': 'text/csv; charset=utf-8',
@@ -183,7 +198,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
     console.log(
       hasExplicitDir
         ? `Scanning brain directory: ${dir}`
-        : 'Scanning multi-source brain directories (Antigravity App + agy CLI + T3 Code ACP)'
+        : 'Scanning installed brain directories (Antigravity / CLI / T3 Code)'
     );
   });
 }

@@ -17,7 +17,17 @@ const tauriInvoke =
     : null;
 const isDesktopApp = Boolean(tauriInvoke);
 
-async function apiGetUsage({ range, granularity, model, source, day }) {
+async function apiGetUsage({
+  range,
+  granularity,
+  model,
+  source,
+  day,
+  startDay,
+  endDay,
+  startTs,
+  endTs,
+}) {
   if (tauriInvoke) {
     return tauriInvoke('get_usage', {
       range,
@@ -25,6 +35,10 @@ async function apiGetUsage({ range, granularity, model, source, day }) {
       model,
       source: source || 'all',
       day: day || null,
+      startDay: startDay || null,
+      endDay: endDay || null,
+      startTs: Number.isFinite(startTs) ? startTs : null,
+      endTs: Number.isFinite(endTs) ? endTs : null,
     });
   }
   const params = new URLSearchParams({
@@ -34,6 +48,10 @@ async function apiGetUsage({ range, granularity, model, source, day }) {
     source: source || 'all',
   });
   if (day) params.set('day', day);
+  if (startDay) params.set('startDay', startDay);
+  if (endDay) params.set('endDay', endDay);
+  if (Number.isFinite(startTs)) params.set('startTs', String(startTs));
+  if (Number.isFinite(endTs)) params.set('endTs', String(endTs));
   const res = await fetch(`/api/usage?${params.toString()}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
@@ -55,6 +73,9 @@ const state = {
   range: '7d',
   prevRange: '7d',
   selectedDay: null,
+  customStartDay: null,
+  customEndDay: null,
+  brushRange: null,
   granularity: 'day',
   granularityManual: false,
   model: 'all',
@@ -92,9 +113,13 @@ const els = {
   dayPrevBtn: document.getElementById('dayPrevBtn'),
   dayPicker: document.getElementById('dayPicker'),
   dayNextBtn: document.getElementById('dayNextBtn'),
+  rangeDateStepper: document.getElementById('rangeDateStepper'),
+  rangeStartPicker: document.getElementById('rangeStartPicker'),
+  rangeEndPicker: document.getElementById('rangeEndPicker'),
   trendTitle: document.getElementById('trendTitle'),
+  trendScopeTag: document.getElementById('trendScopeTag'),
   trendHint: document.getElementById('trendHint'),
-  exitDayBtn: document.getElementById('exitDayBtn'),
+  clearBrushBtn: document.getElementById('clearBrushBtn'),
   granularityControl: document.getElementById('granularityControl'),
   modelFilter: document.getElementById('modelFilter'),
   clearModelBtn: document.getElementById('clearModelBtn'),
@@ -191,11 +216,14 @@ function shiftDayKey(dayKey, deltaDays) {
 }
 
 function enterSingleDay(dayKey) {
-  if (state.range !== 'day') {
+  if (state.range !== 'day' && state.range !== 'custom') {
     state.prevRange = state.range;
   }
   state.range = 'day';
   state.selectedDay = dayKey;
+  state.customStartDay = null;
+  state.customEndDay = null;
+  state.brushRange = null;
   state.granularity = 'hour';
   state.granularityManual = false;
   state.expandedSessionId = null;
@@ -203,10 +231,99 @@ function enterSingleDay(dayKey) {
   fetchUsage();
 }
 
+function enterDateRange(startDay, endDay) {
+  if (!startDay || !endDay) return;
+  const [s, e] = startDay <= endDay ? [startDay, endDay] : [endDay, startDay];
+  if (state.range !== 'day' && state.range !== 'custom') {
+    state.prevRange = state.range;
+  }
+  state.range = 'custom';
+  state.selectedDay = null;
+  state.customStartDay = s;
+  state.customEndDay = e;
+  state.brushRange = null;
+  state.granularity = s === e ? 'hour' : 'day';
+  state.granularityManual = false;
+  state.expandedSessionId = null;
+  syncSegmentedButtons();
+  fetchUsage();
+}
+
+function snapshotRestoreState() {
+  return (
+    state.brushRange?.restore || {
+      range: state.range,
+      prevRange: state.prevRange,
+      selectedDay: state.selectedDay,
+      customStartDay: state.customStartDay,
+      customEndDay: state.customEndDay,
+      granularity: state.granularity,
+      granularityManual: state.granularityManual,
+    }
+  );
+}
+
+function enterBrushDayRange(startDay, endDay) {
+  if (!startDay || !endDay) return;
+  const [s, e] = startDay <= endDay ? [startDay, endDay] : [endDay, startDay];
+  const restore = snapshotRestoreState();
+  state.brushRange = {
+    kind: 'day',
+    startDay: s,
+    endDay: e,
+    startTs: null,
+    endTs: null,
+    label: s === e ? s : `${s} ~ ${e}`,
+    restore,
+  };
+  state.granularity = s === e ? 'hour' : 'day';
+  state.granularityManual = false;
+  state.expandedSessionId = null;
+  syncSegmentedButtons();
+  fetchUsage();
+}
+
+function enterBrushTimeWindow(startTs, endTs, label) {
+  const restore = snapshotRestoreState();
+  state.brushRange = {
+    kind: 'hour',
+    startDay: null,
+    endDay: null,
+    startTs,
+    endTs,
+    label,
+    restore,
+  };
+  state.granularity = 'hour';
+  state.granularityManual = false;
+  state.expandedSessionId = null;
+  syncSegmentedButtons();
+  fetchUsage();
+}
+
+function clearBrushSelection() {
+  if (!state.brushRange?.restore) return;
+  const r = state.brushRange.restore;
+  state.brushRange = null;
+  state.range = r.range;
+  state.prevRange = r.prevRange;
+  state.selectedDay = r.selectedDay;
+  state.customStartDay = r.customStartDay;
+  state.customEndDay = r.customEndDay;
+  state.granularity = r.granularity;
+  state.granularityManual = r.granularityManual;
+  state.expandedSessionId = null;
+  syncSegmentedButtons();
+  fetchUsage();
+}
+
 function exitSingleDay(targetRange = null) {
   const nextRange = targetRange || state.prevRange || '7d';
-  state.range = nextRange === 'day' ? '7d' : nextRange;
+  state.range = nextRange === 'day' || nextRange === 'custom' ? '7d' : nextRange;
   state.selectedDay = null;
+  state.customStartDay = null;
+  state.customEndDay = null;
+  state.brushRange = null;
   state.granularity = state.range === '24h' ? 'hour' : 'day';
   state.granularityManual = false;
   state.expandedSessionId = null;
@@ -225,23 +342,58 @@ function syncSegmentedButtons() {
     btn.classList.toggle('active', btn.dataset.mode === state.subagentMode);
   });
 
+  const inBrush = Boolean(state.brushRange);
   const inSingleDay = Boolean(state.selectedDay);
+  const inCustomRange = state.range === 'custom' && Boolean(state.customStartDay && state.customEndDay);
+
   els.dayStepper.classList.toggle('hidden', !inSingleDay);
   if (inSingleDay && els.dayPicker.value !== state.selectedDay) {
     els.dayPicker.value = state.selectedDay;
   }
 
-  if (inSingleDay) {
-    els.trendTitle.textContent = `Token 消耗趋势 · ${state.selectedDay}`;
+  if (els.rangeDateStepper) {
+    els.rangeDateStepper.classList.toggle('hidden', !inCustomRange);
+    if (inCustomRange) {
+      if (els.rangeStartPicker.value !== state.customStartDay) {
+        els.rangeStartPicker.value = state.customStartDay;
+      }
+      if (els.rangeEndPicker.value !== state.customEndDay) {
+        els.rangeEndPicker.value = state.customEndDay;
+      }
+    }
+  }
+
+  // Heatmap single-day clear button is strictly for heatmap/single-day selection
+  els.heatmapClearDayBtn.classList.toggle('hidden', !inSingleDay);
+
+  // Brush clear button is strictly for drag-brushed selections on the trend chart
+  if (els.clearBrushBtn) {
+    els.clearBrushBtn.classList.toggle('hidden', !inBrush);
+  }
+
+  els.trendTitle.textContent = 'Token 消耗趋势';
+  if (els.trendScopeTag) {
+    if (inBrush) {
+      els.trendScopeTag.textContent = `框选 ${state.brushRange.label}`;
+      els.trendScopeTag.classList.remove('hidden');
+    } else if (inSingleDay) {
+      els.trendScopeTag.textContent = state.selectedDay;
+      els.trendScopeTag.classList.remove('hidden');
+    } else if (inCustomRange) {
+      els.trendScopeTag.textContent = `${state.customStartDay} ~ ${state.customEndDay}`;
+      els.trendScopeTag.classList.remove('hidden');
+    } else {
+      els.trendScopeTag.textContent = '';
+      els.trendScopeTag.classList.add('hidden');
+    }
+  }
+
+  if (inBrush) {
     els.trendHint.classList.add('hidden');
-    els.exitDayBtn.textContent = `← 返回 ${state.prevRange === 'all' ? '全部' : state.prevRange}`;
-    els.exitDayBtn.classList.remove('hidden');
-    els.heatmapClearDayBtn.classList.remove('hidden');
   } else {
-    els.trendTitle.textContent = 'Token 消耗趋势';
-    els.exitDayBtn.classList.add('hidden');
-    els.heatmapClearDayBtn.classList.add('hidden');
-    els.trendHint.classList.toggle('hidden', state.granularity !== 'day');
+    els.trendHint.textContent =
+      state.granularity === 'day' ? '拖拽框选时段或点击看单日' : '拖拽框选小时段';
+    els.trendHint.classList.remove('hidden');
   }
 }
 
@@ -270,7 +422,13 @@ function renderNotice(meta, summary) {
   }
 
   if (summary.callCount === 0 && meta.allTimeEventsCount > 0 && state.range !== 'all') {
-    const scopeLabel = state.selectedDay ? `日期 ${state.selectedDay}` : `时间范围 (${state.range})`;
+    const scopeLabel = state.brushRange
+      ? `框选时段 (${state.brushRange.label})`
+      : state.selectedDay
+        ? `日期 ${state.selectedDay}`
+        : state.customStartDay && state.customEndDay
+          ? `区间 ${state.customStartDay} ~ ${state.customEndDay}`
+          : `时间范围 (${state.range})`;
     els.noticeBar.className = 'notice';
     els.noticeBar.innerHTML = `
       <span>当前${escapeHtml(scopeLabel)}内没有调用记录，历史共有 ${meta.allTimeEventsCount} 条调用记录。</span>
@@ -280,6 +438,9 @@ function renderNotice(meta, summary) {
     if (btn) {
       btn.addEventListener('click', () => {
         state.selectedDay = null;
+        state.customStartDay = null;
+        state.customEndDay = null;
+        state.brushRange = null;
         state.range = 'all';
         state.granularity = 'day';
         state.granularityManual = false;
@@ -308,13 +469,13 @@ function getActiveSourceLabel(meta) {
 
 function formatSourceShortTag(source) {
   if (source === 'cli') {
-    return '<span class="tag tag-src-cli" title="来自 agy CLI">CLI</span>';
+    return '<span class="tag tag-src-cli" title="来自 CLI">CLI</span>';
   }
   if (source === 't3') {
-    return '<span class="tag tag-src-t3" title="来自 T3 Code ACP">T3</span>';
+    return '<span class="tag tag-src-t3" title="来自 T3 Code">T3</span>';
   }
   if (source === 'app') {
-    return '<span class="tag" title="来自 Antigravity App">App</span>';
+    return '<span class="tag" title="来自 Antigravity">Antigravity</span>';
   }
   return '<span class="tag" title="来自自定义目录">自定义</span>';
 }
@@ -322,10 +483,7 @@ function formatSourceShortTag(source) {
 function renderSourceFilterBar(meta) {
   if (!els.sourceBar || !els.sourceFilterControl) return;
   const sources = getVisibleSources(meta);
-  const shouldShow =
-    Boolean(meta?.isCustomDir) ||
-    sources.length > 1 ||
-    (sources.length === 1 && sources[0]?.id !== 'app');
+  const shouldShow = Boolean(meta?.isCustomDir) || sources.length > 0;
 
   els.sourceBar.classList.toggle('hidden', !shouldShow);
   if (!shouldShow) {
@@ -746,7 +904,7 @@ async function renderSessionDetailInto(tr, session) {
     session.isSubagent && session.parentTitle
       ? ` · 归属主会话: ${session.parentTitle}`
       : '';
-  const sourceLabel = detail.sourceLabel || session.sourceLabel || 'Antigravity App';
+  const sourceLabel = detail.sourceLabel || session.sourceLabel || 'Antigravity';
 
   td.innerHTML = `
     <div class="detail-box">
@@ -907,6 +1065,26 @@ function renderCharts() {
       ? (dayKey) => enterSingleDay(dayKey)
       : null;
 
+  const onSelectRange = ({ startItem, endItem, startIdx, endIdx }) => {
+    if (!startItem || !endItem) return;
+    if (state.data.meta.granularity === 'day') {
+      enterBrushDayRange(startItem.key, endItem.key);
+      return;
+    }
+    const startTs = startItem.ts;
+    const endTs = endItem.ts + 3_600_000;
+    const startDt = new Date(startTs);
+    const endDt = new Date(endTs - 60_000);
+    const sameDay =
+      startDt.getFullYear() === endDt.getFullYear() &&
+      startDt.getMonth() === endDt.getMonth() &&
+      startDt.getDate() === endDt.getDate();
+    const label = sameDay
+      ? `${pad2(startDt.getMonth() + 1)}-${pad2(startDt.getDate())} ${pad2(startDt.getHours())}:00 ~ ${pad2(endDt.getHours())}:59`
+      : `${pad2(startDt.getMonth() + 1)}-${pad2(startDt.getDate())} ${pad2(startDt.getHours())}:00 ~ ${pad2(endDt.getMonth() + 1)}-${pad2(endDt.getDate())} ${pad2(endDt.getHours())}:59`;
+    enterBrushTimeWindow(startTs, endTs, label);
+  };
+
   renderTokenTrendChart({
     container: els.trendChartStage,
     emptyEl: els.trendEmpty,
@@ -914,6 +1092,7 @@ function renderCharts() {
     series: state.data.series,
     visibleSeries: state.visibleSeries,
     onSelectDay,
+    onSelectRange,
   });
   renderCacheRateChart({
     container: els.cacheChartStage,
@@ -942,14 +1121,35 @@ async function fetchUsage() {
   state.loading = true;
   els.refreshBtn.textContent = '扫描中...';
 
-  try {
-    state.data = await apiGetUsage({
+  const buildUsageQuery = () => {
+    if (state.brushRange) {
+      return {
+        range: 'custom',
+        granularity: state.granularity,
+        model: state.model,
+        source: state.source,
+        day: null,
+        startDay: state.brushRange.startDay || null,
+        endDay: state.brushRange.endDay || null,
+        startTs: state.brushRange.startTs,
+        endTs: state.brushRange.endTs,
+      };
+    }
+    return {
       range: state.range,
       granularity: state.granularity,
       model: state.model,
       source: state.source,
       day: state.selectedDay,
-    });
+      startDay: state.customStartDay,
+      endDay: state.customEndDay,
+      startTs: null,
+      endTs: null,
+    };
+  };
+
+  try {
+    state.data = await apiGetUsage(buildUsageQuery());
     const availSources = getVisibleSources(state.data?.meta);
     if (
       state.source !== 'all' &&
@@ -957,13 +1157,7 @@ async function fetchUsage() {
       !availSources.some((s) => s.id === state.source)
     ) {
       state.source = 'all';
-      state.data = await apiGetUsage({
-        range: state.range,
-        granularity: state.granularity,
-        model: state.model,
-        source: state.source,
-        day: state.selectedDay,
-      });
+      state.data = await apiGetUsage(buildUsageQuery());
     }
     state.sessionDetailCache.clear();
     renderAll();
@@ -998,15 +1192,26 @@ async function handlePickDir(evt) {
 // Event bindings
 els.rangeControl.addEventListener('click', (evt) => {
   const btn = evt.target.closest('.seg-btn');
-  if (!btn || btn.dataset.range === state.range) return;
+  if (!btn) return;
   const next = btn.dataset.range;
+  if (next === state.range && !state.brushRange) return;
   if (next === 'day') {
     const avail = state.data?.meta?.availableDays || [];
     const defaultDay = avail.length > 0 ? avail[avail.length - 1] : formatTodayKey();
     enterSingleDay(defaultDay);
     return;
   }
+  if (next === 'custom') {
+    const avail = state.data?.meta?.availableDays || [];
+    const endDay = avail.length > 0 ? avail[avail.length - 1] : formatTodayKey();
+    const startDay = shiftDayKey(endDay, -6);
+    enterDateRange(startDay, endDay);
+    return;
+  }
   state.selectedDay = null;
+  state.customStartDay = null;
+  state.customEndDay = null;
+  state.brushRange = null;
   state.range = next;
   state.prevRange = next;
   if (!state.granularityManual) {
@@ -1014,6 +1219,18 @@ els.rangeControl.addEventListener('click', (evt) => {
   }
   syncSegmentedButtons();
   fetchUsage();
+});
+
+els.rangeStartPicker?.addEventListener('change', () => {
+  const s = els.rangeStartPicker.value;
+  const e = els.rangeEndPicker?.value || s;
+  if (s) enterDateRange(s, e);
+});
+
+els.rangeEndPicker?.addEventListener('change', () => {
+  const e = els.rangeEndPicker.value;
+  const s = els.rangeStartPicker?.value || e;
+  if (e) enterDateRange(s, e);
 });
 
 els.dayPicker.addEventListener('change', () => {
@@ -1030,8 +1247,8 @@ els.dayNextBtn.addEventListener('click', () => {
   enterSingleDay(shiftDayKey(state.selectedDay || formatTodayKey(), 1));
 });
 
-els.exitDayBtn.addEventListener('click', () => {
-  exitSingleDay();
+els.clearBrushBtn?.addEventListener('click', () => {
+  clearBrushSelection();
 });
 
 els.heatmapClearDayBtn.addEventListener('click', () => {
@@ -1042,6 +1259,10 @@ els.granularityControl.addEventListener('click', (evt) => {
   const btn = evt.target.closest('.seg-btn');
   if (!btn) return;
   const nextGran = btn.dataset.granularity;
+  if (state.brushRange?.kind === 'hour' && nextGran === 'day') {
+    clearBrushSelection();
+    return;
+  }
   if (state.selectedDay && nextGran === 'day') {
     exitSingleDay();
     return;
@@ -1126,16 +1347,34 @@ if (isDesktopApp && els.dirBtn) {
 }
 
 els.exportBtn.addEventListener('click', async () => {
-  if (tauriInvoke) {
-    const origText = els.exportBtn.textContent;
-    try {
-      const res = await tauriInvoke('export_csv', {
+  const exportQuery = state.brushRange
+    ? {
+        range: 'custom',
+        granularity: state.granularity,
+        model: state.model,
+        source: state.source,
+        day: null,
+        startDay: state.brushRange.startDay || null,
+        endDay: state.brushRange.endDay || null,
+        startTs: state.brushRange.startTs,
+        endTs: state.brushRange.endTs,
+      }
+    : {
         range: state.range,
         granularity: state.granularity,
         model: state.model,
         source: state.source,
         day: state.selectedDay || null,
-      });
+        startDay: state.customStartDay || null,
+        endDay: state.customEndDay || null,
+        startTs: null,
+        endTs: null,
+      };
+
+  if (tauriInvoke) {
+    const origText = els.exportBtn.textContent;
+    try {
+      const res = await tauriInvoke('export_csv', exportQuery);
       if (res?.saved) {
         els.exportBtn.textContent = '已导出';
         setTimeout(() => {
@@ -1150,12 +1389,20 @@ els.exportBtn.addEventListener('click', async () => {
   }
 
   const params = new URLSearchParams({
-    range: state.range,
-    granularity: state.granularity,
-    model: state.model,
-    source: state.source,
+    range: exportQuery.range,
+    granularity: exportQuery.granularity,
+    model: exportQuery.model,
+    source: exportQuery.source,
   });
-  if (state.selectedDay) params.set('day', state.selectedDay);
+  if (Number.isFinite(exportQuery.startTs) && Number.isFinite(exportQuery.endTs)) {
+    params.set('startTs', String(exportQuery.startTs));
+    params.set('endTs', String(exportQuery.endTs));
+  } else if (exportQuery.startDay && exportQuery.endDay) {
+    params.set('startDay', exportQuery.startDay);
+    params.set('endDay', exportQuery.endDay);
+  } else if (exportQuery.day) {
+    params.set('day', exportQuery.day);
+  }
   window.location.href = `/api/export.csv?${params.toString()}`;
 });
 

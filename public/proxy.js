@@ -22,20 +22,6 @@ function nowTimeStr() {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-function compactDisplayPath(rawPath, maxLen = 62) {
-  const s = String(rawPath || '').trim();
-  if (!s || s.length <= maxLen) return s;
-  const sep = s.includes('\\') ? '\\' : '/';
-  const parts = s.split(/[\\/]+/).filter(Boolean);
-  if (parts.length <= 3) return s;
-  const file = parts[parts.length - 1];
-  const parent = parts[parts.length - 2];
-  const shortParent =
-    parent.length > 18 ? `${parent.slice(0, 8)}…${parent.slice(-6)}` : parent;
-  const head = parts[0].endsWith(':') ? `${parts[0]}${sep}${parts[1]}` : parts[0];
-  return `${head}${sep}…${sep}${shortParent}${sep}${file}`;
-}
-
 function normPathKey(p) {
   return String(p || '')
     .trim()
@@ -50,6 +36,13 @@ function slugifyToolId(raw) {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return slug || 'tool';
+}
+
+function isGeminiDesktopTool(tool) {
+  if (!tool) return false;
+  if (tool.id === 'gemini-desktop') return true;
+  const key = normPathKey(tool.exePath);
+  return key.includes('\\google\\gemini\\') && key.endsWith('\\gemini.exe');
 }
 
 export function initProxyModule() {
@@ -109,6 +102,7 @@ export function initProxyModule() {
     btnSyncShim: document.getElementById('proxyBtnSyncShim'),
     btnCopySnippets: document.getElementById('proxyBtnCopySnippets'),
     btnStopCli: document.getElementById('proxyBtnStopCli'),
+    btnDetectTools: document.getElementById('proxyBtnDetectTools'),
     btnAddTool: document.getElementById('proxyBtnAddTool'),
     toolForm: document.getElementById('proxyToolForm'),
     toolName: document.getElementById('proxyToolName'),
@@ -122,9 +116,6 @@ export function initProxyModule() {
     toolSaveBtn: document.getElementById('proxyToolSaveBtn'),
     toolCancelBtn: document.getElementById('proxyToolCancelBtn'),
     cliToolsBody: document.getElementById('proxyCliToolsBody'),
-    cliPathText: document.getElementById('proxyCliPathText'),
-    shimDirText: document.getElementById('proxyShimDirText'),
-    shimPathTag: document.getElementById('proxyShimPathTag'),
 
     subViewControl: document.getElementById('proxySubViewControl'),
     tabConnBtn: document.getElementById('proxyTabConnBtn'),
@@ -160,6 +151,7 @@ export function initProxyModule() {
     settings: null,
     cliTools: [],
     cliToolsInitialized: false,
+    builtinToolsDiscovered: [],
     editingToolId: null,
     snapshot: null,
     displayedConnections: [],
@@ -210,6 +202,7 @@ export function initProxyModule() {
       els.btnSyncShim,
       els.btnStopCli,
       els.btnDetectCli,
+      els.btnDetectTools,
     ]
       .filter(Boolean)
       .forEach((btn) => {
@@ -245,24 +238,73 @@ export function initProxyModule() {
       els.cliToolsBody.innerHTML = `
         <tr class="empty-row">
           <td colspan="4">
-            <span>当前尚未配置外部工具（如 T3 Code）</span>
-            <button type="button" class="btn" id="proxyBtnAutoDetectTools" style="margin-left: 10px;">自动探测 T3 Code</button>
+            <span>当前尚未配置外部应用（如 Gemini Desktop、T3 Code）</span>
+            <button type="button" class="btn" id="proxyBtnAutoDetectTools" style="margin-left: 10px;">自动探测应用</button>
           </td>
         </tr>
       `;
       return;
     }
 
+    const snap = state.snapshot;
+    const sysOn = Boolean(snap?.systemProxyEnabled);
+    const tunOn = Boolean(snap?.tunEnabled);
+    const managedSys = Boolean(snap?.geminiSystemProxyManaged);
+    const geminiHasDirect = (state.displayedConnections || []).some(
+      (c) =>
+        c.category === 'publicDirect' &&
+        String(c.processName || '').toLowerCase() === 'gemini'
+    );
+
     els.cliToolsBody.innerHTML = state.cliTools
       .map((tool) => {
         const running = counts[tool.id] || 0;
-        const modeLabel = tool.isChromium ? 'Chromium + Env' : '仅环境变量';
+        const isGemini = isGeminiDesktopTool(tool);
+        let modeHtml;
+        let hintHtml = '';
+        if (isGemini) {
+          if (managedSys && sysOn) {
+            modeHtml =
+              '<span class="tag tag-ok mono" title="已自动开启 Windows 系统代理，退出 Gemini 后将自动关闭">系统代理 · 自动托管</span>';
+            hintHtml =
+              '<div class="cli-tool-note cli-tool-note-muted">已自动开启系统代理，关闭 Gemini 后将自动恢复</div>';
+          } else if (sysOn) {
+            modeHtml =
+              '<span class="tag tag-ok mono" title="Windows 系统代理已开启，Gemini 页面流量正通过代理">系统代理 · 已生效</span>';
+          } else if (tunOn) {
+            modeHtml =
+              '<span class="tag tag-ok mono" title="TUN 模式已开启，Gemini 流量正通过 TUN 代理">TUN · 已生效</span>';
+          } else if (running > 0 && geminiHasDirect) {
+            modeHtml =
+              '<span class="tag tag-err mono" title="未开启系统代理或 TUN，检测到 Gemini 正在公网直连">未代理 · 直连中</span>';
+            hintHtml =
+              '<div class="cli-tool-note">未开启系统代理或 TUN，点击「重启」可自动开启系统代理</div>';
+          } else if (running > 0) {
+            modeHtml =
+              '<span class="tag tag-warn mono" title="未开启系统代理或 TUN，点击「重启」可自动开启系统代理">未开启系统代理</span>';
+            hintHtml =
+              '<div class="cli-tool-note">未开启系统代理或 TUN，点击「重启」可自动开启系统代理</div>';
+          } else {
+            modeHtml =
+              '<span class="tag mono" title="启动时自动开启 Windows 系统代理，关闭 Gemini 后自动关闭">自动系统代理</span>';
+            hintHtml =
+              '<div class="cli-tool-note cli-tool-note-muted">启动时自动开启系统代理，关闭后自动恢复</div>';
+          }
+        } else {
+          modeHtml = `<span class="tag mono">${tool.isChromium ? 'Chromium + Env' : '仅环境变量'}</span>`;
+        }
         const statusHtml = !tool.monitor
           ? '<span class="tag">未监控</span>'
           : running > 0
             ? `<span class="tag tag-ok">运行中 x${running}</span>`
             : '<span class="tag">未运行</span>';
-        const launchLabel = running > 0 ? '隔离重启' : '隔离启动';
+        const launchLabel = isGemini
+          ? running > 0
+            ? '重启'
+            : '启动'
+          : running > 0
+            ? '隔离重启'
+            : '隔离启动';
         const launchClass = running > 0 ? 'btn' : 'btn btn-primary';
         const argsTag = tool.args
           ? `<span class="tag mono">${escapeHtml(tool.args)}</span>`
@@ -285,9 +327,10 @@ export function initProxyModule() {
                   ${dirTag}
                 </div>
                 <div class="cli-tool-path mono" title="${escapeHtml(tool.exePath)}">${escapeHtml(tool.exePath)}</div>
+                ${hintHtml}
               </div>
             </td>
-            <td><span class="tag mono">${modeLabel}</span></td>
+            <td>${modeHtml}</td>
             <td>${statusHtml}</td>
             <td>
               <div class="cli-tool-actions">
@@ -313,7 +356,7 @@ export function initProxyModule() {
 
     if (!filtered.length) {
       els.connTableBody.innerHTML =
-        '<tr class="empty-row"><td colspan="6">当前没有可显示的外部连接（在 Antigravity、agy CLI 或 T3 Code 发一条消息即可看到实时套接字）</td></tr>';
+        '<tr class="empty-row"><td colspan="6">当前没有可显示的外部连接（在 Antigravity、Gemini Desktop、agy CLI 或 T3 Code 发一条消息即可看到实时套接字）</td></tr>';
       return;
     }
 
@@ -334,7 +377,7 @@ export function initProxyModule() {
             <td class="num">${c.pid}</td>
             <td class="mono">${escapeHtml(c.localEndpoint)}</td>
             <td class="mono">${escapeHtml(c.remoteEndpoint)}</td>
-            <td class="mono">${escapeHtml(c.state)} · ${escapeHtml(c.seenAt)}</td>
+            <td class="mono nowrap">${escapeHtml(c.state)} · ${escapeHtml(c.seenAt)}</td>
           </tr>
         `;
       })
@@ -391,7 +434,9 @@ export function initProxyModule() {
 
     const modeSuffix = snap.clashMode && snap.clashMode !== '未知' ? ` (${snap.clashMode})` : '';
     const bypassTag = bypassEnabled ? ' · 国内直连' : '';
-    els.headlineSub.textContent = `${snap.proxyHost}:${snap.resolvedPort}${modeSuffix}${bypassTag} · ${snap.portSource}`;
+    const headlineShort = `${snap.proxyHost}:${snap.resolvedPort}${modeSuffix}${bypassTag}`;
+    els.headlineSub.textContent = headlineShort;
+    els.headlineSub.title = `${headlineShort} · ${snap.portSource}`;
 
     els.launchBtn.textContent = agyProcs > 0 ? '重启 Antigravity' : '启动 Antigravity';
 
@@ -399,15 +444,20 @@ export function initProxyModule() {
     const sysText = snap.systemProxyEnabled ? '系统代理 开' : '系统代理 关';
     const tunText = snap.tunEnabled ? 'TUN 开' : 'TUN 关';
     els.envValue.textContent = `${sysText} / ${tunText}`;
-    if (snap.systemProxyEnabled || snap.tunEnabled) {
+    if (snap.geminiSystemProxyManaged && snap.systemProxyEnabled && !snap.tunEnabled) {
+      els.envSub.textContent = `Gemini 自动托管中 (${snap.systemProxyServer || '已开启'})，退出后自动恢复`;
+    } else if (snap.systemProxyEnabled || snap.tunEnabled) {
       els.envSub.textContent = snap.tunEnabled
         ? `网卡: ${snap.tunAdapterText || 'TUN Active'}`
         : `系统代理: ${snap.systemProxyServer || '已开启'}`;
     } else {
-      els.envSub.textContent = '不改系统代理，仅隔离 Antigravity 与 CLI';
+      els.envSub.textContent = '不改系统代理，仅隔离已托管应用与 CLI';
     }
 
-    els.warnBanner.classList.toggle('hidden', !(snap.systemProxyEnabled || snap.tunEnabled));
+    const showSysWarn =
+      Boolean(snap.tunEnabled) ||
+      (Boolean(snap.systemProxyEnabled) && !snap.geminiSystemProxyManaged);
+    els.warnBanner.classList.toggle('hidden', !showSysWarn);
     if (els.globalWarnBanner) {
       const isGlobalMode = String(snap.clashMode || '').trim().toLowerCase() === 'global';
       els.globalWarnBanner.classList.toggle('hidden', !isGlobalMode);
@@ -415,7 +465,14 @@ export function initProxyModule() {
 
     // Process cell
     els.procValue.textContent = `${totalProcs} 进程`;
-    els.procSub.textContent = `App x${snap.antigravityProcCount} · LS x${snap.languageServerProcCount} · CLI x${cliProcs} · 工具 x${toolProcs} · Clash ${snap.isClashRunning ? '运行中' : '未运行'}`;
+    const procParts = [];
+    if (snap.antigravityProcCount > 0) procParts.push(`App x${snap.antigravityProcCount}`);
+    if (snap.languageServerProcCount > 0) procParts.push(`LS x${snap.languageServerProcCount}`);
+    if (cliProcs > 0) procParts.push(`CLI x${cliProcs}`);
+    if (toolProcs > 0) procParts.push(`应用 x${toolProcs}`);
+    procParts.push(`Clash ${snap.isClashRunning ? '开' : '关'}`);
+    els.procSub.textContent = procParts.join(' · ');
+    els.procSub.title = `App x${snap.antigravityProcCount} · LS x${snap.languageServerProcCount} · CLI x${cliProcs} · 应用 x${toolProcs} · Clash ${snap.isClashRunning ? '运行中' : '未运行'}`;
 
     // Connections count cell
     els.connValue.innerHTML = `
@@ -423,7 +480,7 @@ export function initProxyModule() {
     `;
     els.connSub.textContent = '走代理 / TUN / 公网直连';
 
-    // CLI & Shim status strip
+    // CLI & Shim status tags
     const shim = snap.cliShim || {};
     if (els.cliStatusTag) {
       if (cliProcs > 0) {
@@ -436,6 +493,7 @@ export function initProxyModule() {
         els.cliStatusTag.textContent = '未检测到 CLI';
         els.cliStatusTag.className = 'tag mono tag-warn';
       }
+      els.cliStatusTag.title = shim.cliPath ? `CLI: ${shim.cliPath}` : '未检测到 agy.exe';
     }
     if (els.shimStatusTag) {
       if (shim.enabled && shim.outOfSync) {
@@ -448,6 +506,7 @@ export function initProxyModule() {
         els.shimStatusTag.textContent = 'Shim 未启用';
         els.shimStatusTag.className = 'tag mono';
       }
+      els.shimStatusTag.title = shim.shimDir ? `Shim 目录: ${shim.shimDir}` : '';
     }
     if (els.btnToggleShim) {
       els.btnToggleShim.textContent = shim.enabled ? '停用 CLI Shim' : '启用 CLI Shim';
@@ -457,36 +516,6 @@ export function initProxyModule() {
     }
     if (els.btnStopCli) {
       els.btnStopCli.classList.toggle('hidden', cliProcs === 0);
-    }
-    if (els.cliPathText) {
-      if (shim.cliPath) {
-        els.cliPathText.textContent = compactDisplayPath(shim.cliPath, 64);
-        els.cliPathText.title = `${shim.cliPath}（点击复制完整路径）`;
-        els.cliPathText.dataset.fullPath = shim.cliPath;
-        els.cliPathText.classList.add('acc-copyable');
-      } else {
-        els.cliPathText.textContent = '未检测到（可在「设置」配置或重新探测）';
-        els.cliPathText.title = '';
-        delete els.cliPathText.dataset.fullPath;
-        els.cliPathText.classList.remove('acc-copyable');
-      }
-    }
-    if (els.shimDirText) {
-      if (shim.shimDir) {
-        els.shimDirText.textContent = compactDisplayPath(shim.shimDir, 42);
-        els.shimDirText.title = `${shim.shimDir}（点击复制完整路径）`;
-        els.shimDirText.dataset.fullPath = shim.shimDir;
-        els.shimDirText.classList.add('acc-copyable');
-      } else {
-        els.shimDirText.textContent = '—';
-        els.shimDirText.title = '';
-        delete els.shimDirText.dataset.fullPath;
-        els.shimDirText.classList.remove('acc-copyable');
-      }
-    }
-    if (els.shimPathTag) {
-      els.shimPathTag.textContent = shim.enabled ? '已加入 PATH' : '未加入 PATH';
-      els.shimPathTag.className = shim.enabled ? 'tag mono tag-ok' : 'tag mono';
     }
 
     renderCliTools();
@@ -514,6 +543,9 @@ export function initProxyModule() {
     els.inputWorkspace.value = s.workspacePath || '';
     state.cliTools = Array.isArray(s.cliTools) ? s.cliTools.map((t) => ({ ...t })) : [];
     state.cliToolsInitialized = Boolean(s.cliToolsInitialized);
+    state.builtinToolsDiscovered = Array.isArray(s.builtinToolsDiscovered)
+      ? [...s.builtinToolsDiscovered]
+      : [];
     renderCliTools();
   }
 
@@ -534,6 +566,7 @@ export function initProxyModule() {
       cliPath: els.inputCliPath ? els.inputCliPath.value.trim() : '',
       cliTools: state.cliTools,
       cliToolsInitialized: state.cliToolsInitialized,
+      builtinToolsDiscovered: state.builtinToolsDiscovered,
     };
   }
 
@@ -547,6 +580,9 @@ export function initProxyModule() {
         state.settings = saved;
         state.cliTools = Array.isArray(saved.cliTools) ? saved.cliTools.map((t) => ({ ...t })) : [];
         state.cliToolsInitialized = Boolean(saved.cliToolsInitialized);
+        state.builtinToolsDiscovered = Array.isArray(saved.builtinToolsDiscovered)
+          ? [...saved.builtinToolsDiscovered]
+          : [];
         if (els.inputCliPath && document.activeElement !== els.inputCliPath) {
           els.inputCliPath.value = saved.cliPath || '';
         }
@@ -634,10 +670,10 @@ export function initProxyModule() {
       const res = await tauriInvoke('proxy_launch_cli_tool', { toolId, forceRestart });
       for (const l of res.logs || []) appendLog(l);
       if (res.needConfirm) {
-        showConfirm(
-          `检测到 ${tool.name} 当前有 ${res.processCount} 个相关进程正在运行（含子进程 agy）。必须重启才能让隔离代理生效，确认关闭并重启？`,
-          () => runLaunchTool(toolId, true)
-        );
+        const confirmMsg = isGeminiDesktopTool(tool)
+          ? `检测到 ${tool.name} 当前有 ${res.processCount} 个相关进程正在运行，确认关闭并重新启动？`
+          : `检测到 ${tool.name} 当前有 ${res.processCount} 个相关进程正在运行。必须重启才能让隔离代理生效，确认关闭并重启？`;
+        showConfirm(confirmMsg, () => runLaunchTool(toolId, true));
         return;
       }
       if (!res.ok && res.error) {
@@ -673,7 +709,7 @@ export function initProxyModule() {
     };
     if (running > 0) {
       showConfirm(
-        `确定要结束 ${tool.name} 及其 ${running} 个相关进程（含子进程 agy）吗？`,
+        `确定要结束 ${tool.name} 及其 ${running} 个相关进程吗？`,
         doStop
       );
     } else {
@@ -779,7 +815,9 @@ export function initProxyModule() {
       }
 
       if (addedNames.length) {
-        appendLog(`[OK] 已自动添加外部工具: ${addedNames.join(', ')}`);
+        appendLog(`[OK] 已自动添加应用: ${addedNames.join(', ')}`);
+      } else if (!overrideCliPath) {
+        appendLog('[i] 未发现新的可自动添加应用（Gemini Desktop / T3 Code）。');
       }
       state.cliToolsInitialized = true;
       if (changed) {
@@ -1056,6 +1094,10 @@ export function initProxyModule() {
     });
   }
 
+  if (els.btnDetectTools) {
+    els.btnDetectTools.addEventListener('click', () => detectCliAndTools(false));
+  }
+
   if (els.btnAddTool) {
     els.btnAddTool.addEventListener('click', () => {
       if (els.toolForm && !els.toolForm.classList.contains('hidden') && !state.editingToolId) {
@@ -1210,24 +1252,6 @@ export function initProxyModule() {
   els.btnClearLog.addEventListener('click', () => {
     state.logs = [];
     els.logPre.textContent = '';
-  });
-
-  [els.cliPathText, els.shimDirText].filter(Boolean).forEach((el) => {
-    el.addEventListener('click', async () => {
-      const fullPath = el.dataset.fullPath;
-      if (!fullPath) return;
-      try {
-        await navigator.clipboard.writeText(fullPath);
-        const orig = el.textContent;
-        el.textContent = '已复制路径';
-        appendLog(`[OK] 已复制路径: ${fullPath}`);
-        setTimeout(() => {
-          if (el.textContent === '已复制路径') el.textContent = orig;
-        }, 1200);
-      } catch {
-        appendLog(`[!] 无法写入剪贴板: ${fullPath}`);
-      }
-    });
   });
 
   let initialized = false;

@@ -27,6 +27,7 @@
       <div class="controls-group" id="usageControls">
         <div class="segmented" id="rangeControl" role="group" aria-label="时间范围">
           <button type="button" class="seg-btn" data-range="day">单日</button>
+          <button type="button" class="seg-btn" data-range="custom">区间</button>
           <button type="button" class="seg-btn" data-range="24h">24h</button>
           <button type="button" class="seg-btn active" data-range="7d">7d</button>
           <button type="button" class="seg-btn" data-range="30d">30d</button>
@@ -37,6 +38,12 @@
           <button type="button" class="step-btn" id="dayPrevBtn" title="前一天">‹</button>
           <input type="date" id="dayPicker" class="date-input mono" />
           <button type="button" class="step-btn" id="dayNextBtn" title="后一天">›</button>
+        </div>
+
+        <div class="range-stepper hidden" id="rangeDateStepper" aria-label="选择日期区间">
+          <input type="date" id="rangeStartPicker" class="date-input mono" title="起始日期" />
+          <span class="range-sep">~</span>
+          <input type="date" id="rangeEndPicker" class="date-input mono" title="结束日期" />
         </div>
 
         <button type="button" class="btn hidden" id="dirBtn" title="选择自定义日志目录（按住 Shift 点击恢复自动多来源聚合）">
@@ -163,10 +170,18 @@
         <div class="panel-title-group">
           <h2 class="panel-title">用量日历</h2>
           <span class="panel-note mono" id="heatmapSummary">近 1 年活跃 0 天</span>
-          <span class="panel-note">点击任意格子直达当日 24 小时明细</span>
         </div>
         <div class="panel-actions">
-          <button type="button" class="link-btn hidden" id="heatmapClearDayBtn">清除选中</button>
+          <div class="heat-legend" aria-hidden="true">
+            <span>少</span>
+            <span class="heat-dot l0"></span>
+            <span class="heat-dot l1"></span>
+            <span class="heat-dot l2"></span>
+            <span class="heat-dot l3"></span>
+            <span class="heat-dot l4"></span>
+            <span>多</span>
+          </div>
+          <button type="button" class="btn btn-sm hidden" id="heatmapClearDayBtn">清除单日</button>
         </div>
       </div>
       <div class="heatmap-stage" id="heatmapStage"></div>
@@ -177,8 +192,8 @@
       <div class="panel-header">
         <div class="panel-title-group">
           <h2 class="panel-title" id="trendTitle">Token 消耗趋势</h2>
-          <span class="panel-note" id="trendHint">点击柱条查看当日按小时明细</span>
-          <button type="button" class="link-btn hidden" id="exitDayBtn">← 返回 7d</button>
+          <span class="tag tag-accent mono hidden" id="trendScopeTag"></span>
+          <span class="panel-note" id="trendHint">拖拽框选时段</span>
           <div class="legend-group" id="seriesLegend">
             <button type="button" class="legend-item active" data-series="outputTokens">
               <span class="swatch swatch-output"></span>
@@ -196,6 +211,7 @@
         </div>
 
         <div class="panel-actions">
+          <button type="button" class="btn btn-sm btn-accent hidden" id="clearBrushBtn">清除框选</button>
           <label class="select-wrap" for="modelFilter">
             <span class="sr-only">模型筛选</span>
             <select id="modelFilter" class="select-input mono">
@@ -332,7 +348,7 @@
     <div class="audit-bar hidden" id="proxyAuditBar">
       <div class="audit-head mono">
         <span id="proxyAuditLabel">验收中 0/20s</span>
-        <span>请在 Antigravity、agy CLI 或接入工具中触发模型请求</span>
+        <span>请在 Antigravity、Gemini Desktop、agy CLI 或接入应用中触发请求</span>
       </div>
       <div class="audit-track"><div class="audit-fill" id="proxyAuditFill"></div></div>
     </div>
@@ -451,36 +467,37 @@
       </div>
     </section>
 
-    <!-- CLI & External Tools Isolation Panel -->
+    <!-- Apps, CLI & External Tools Isolation Panel -->
     <section class="panel" id="proxyCliPanel">
       <div class="panel-header">
         <div class="panel-title-group">
-          <h2 class="panel-title">CLI 与工具独立代理</h2>
+          <h2 class="panel-title">应用与 CLI 独立代理</h2>
           <span class="tag mono" id="proxyCliStatusTag">检测中...</span>
           <span class="tag mono" id="proxyShimStatusTag">Shim 未启用</span>
         </div>
         <div class="panel-actions cli-header-actions">
-          <button type="button" class="btn btn-primary" id="proxyBtnCliTerminal" title="打开仅在当前终端窗口注入代理变量的命令行（含 agy PATH）">打开代理终端</button>
+          <button type="button" class="btn btn-primary" id="proxyBtnCliTerminal" title="打开仅在当前终端窗口注入代理变量的命令行（含 agy PATH）">代理终端</button>
           <button type="button" class="btn" id="proxyBtnTestCli" title="使用当前隔离代理执行 agy models 验证连通性">测试 CLI</button>
           <button type="button" class="btn" id="proxyBtnToggleShim" title="在用户 PATH 写入隔离代理脚本（不改动原 agy.exe 与系统代理）">启用 CLI Shim</button>
           <button type="button" class="btn hidden" id="proxyBtnSyncShim" title="代理端口或直连规则已变更，点击同步更新 Shim 脚本">同步 Shim</button>
-          <button type="button" class="btn" id="proxyBtnCopySnippets" title="复制 PowerShell 代理变量命令，并在日志中输出 CMD / Bash 命令">复制终端命令</button>
+          <button type="button" class="btn" id="proxyBtnCopySnippets" title="复制 PowerShell 代理变量命令，并在日志中输出 CMD / Bash 命令">复制命令</button>
           <button type="button" class="btn btn-danger-subtle hidden" id="proxyBtnStopCli" title="结束当前运行的 agy CLI 进程">结束 CLI</button>
-          <button type="button" class="btn" id="proxyBtnAddTool">添加工具</button>
+          <button type="button" class="btn" id="proxyBtnDetectTools" title="自动探测本机安装的 Gemini Desktop、T3 Code 与 agy CLI">探测应用</button>
+          <button type="button" class="btn" id="proxyBtnAddTool">添加应用</button>
         </div>
       </div>
 
       <div class="cli-tool-form hidden" id="proxyToolForm">
         <div class="settings-grid">
           <div class="field-row">
-            <label class="field-label" for="proxyToolName">工具名称</label>
+            <label class="field-label" for="proxyToolName">应用名称</label>
             <div class="field-inline">
-              <input type="text" id="proxyToolName" class="text-input" placeholder="例如 T3 Code 或自定义工具名" style="width: 220px;" />
+              <input type="text" id="proxyToolName" class="text-input" placeholder="例如 Gemini Desktop、T3 Code 或自定义应用" style="width: 240px;" />
               <label class="check-label" title="Electron / Chromium 应用需同时传入 --proxy-server 与 --proxy-bypass-list；普通 CLI/工具仅注入代理环境变量">
                 <input type="checkbox" id="proxyToolIsChromium" checked />
                 <span>Electron/Chromium 模式</span>
               </label>
-              <label class="check-label" title="在连接明细与进程面板中自动跟踪该工具的 TCP 连接">
+              <label class="check-label" title="在连接明细与进程面板中自动跟踪该应用的 TCP 连接">
                 <input type="checkbox" id="proxyToolMonitor" checked />
                 <span>监控进程与连接</span>
               </label>
@@ -507,7 +524,7 @@
             <div class="field-path">
               <input type="text" id="proxyToolWorkDir" class="text-input mono flex-1" placeholder="留空则默认使用可执行文件所在目录" />
               <button type="button" class="btn" id="proxyToolBrowseDir">浏览</button>
-              <button type="button" class="btn" id="proxyToolSaveBtn">保存工具</button>
+              <button type="button" class="btn btn-primary" id="proxyToolSaveBtn">保存应用</button>
               <button type="button" class="btn" id="proxyToolCancelBtn">取消</button>
             </div>
           </div>
@@ -518,29 +535,16 @@
         <table class="data-table cli-tools-table">
           <thead>
             <tr>
-              <th>工具与路径</th>
-              <th style="width: 132px;">代理模式</th>
+              <th>应用与路径</th>
+              <th style="width: 152px;">代理模式</th>
               <th style="width: 96px;">运行状态</th>
               <th style="width: 244px;">操作</th>
             </tr>
           </thead>
           <tbody id="proxyCliToolsBody">
-            <tr class="empty-row"><td colspan="4">正在扫描 CLI 工具配置...</td></tr>
+            <tr class="empty-row"><td colspan="4">正在扫描应用与工具配置...</td></tr>
           </tbody>
         </table>
-      </div>
-
-      <div class="cli-shim-bar" id="proxyCliMetaBar">
-        <div class="cli-meta-item">
-          <span class="cli-meta-label">CLI</span>
-          <span class="cli-meta-path mono" id="proxyCliPathText" title="">检测中...</span>
-        </div>
-        <span class="cli-meta-divider" aria-hidden="true"></span>
-        <div class="cli-meta-item cli-meta-item-shim">
-          <span class="cli-meta-label">Shim</span>
-          <span class="cli-meta-path mono" id="proxyShimDirText" title="">—</span>
-          <span class="tag mono" id="proxyShimPathTag">未加入 PATH</span>
-        </div>
       </div>
     </section>
 
@@ -576,11 +580,11 @@
           <thead>
             <tr>
               <th style="width: 112px;">分类</th>
-              <th style="width: 170px;">进程</th>
+              <th style="width: 164px;">进程</th>
               <th class="num" style="width: 72px;">PID</th>
               <th>本地端点</th>
               <th>远端端点</th>
-              <th style="width: 170px;">状态 · 捕获时间</th>
+              <th style="width: 196px;">状态 · 捕获时间</th>
             </tr>
           </thead>
           <tbody id="proxyConnTableBody">
