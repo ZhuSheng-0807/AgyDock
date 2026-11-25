@@ -22,6 +22,20 @@ function nowTimeStr() {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+function compactDisplayPath(rawPath, maxLen = 62) {
+  const s = String(rawPath || '').trim();
+  if (!s || s.length <= maxLen) return s;
+  const sep = s.includes('\\') ? '\\' : '/';
+  const parts = s.split(/[\\/]+/).filter(Boolean);
+  if (parts.length <= 3) return s;
+  const file = parts[parts.length - 1];
+  const parent = parts[parts.length - 2];
+  const shortParent =
+    parent.length > 18 ? `${parent.slice(0, 8)}…${parent.slice(-6)}` : parent;
+  const head = parts[0].endsWith(':') ? `${parts[0]}${sep}${parts[1]}` : parts[0];
+  return `${head}${sep}…${sep}${shortParent}${sep}${file}`;
+}
+
 function normPathKey(p) {
   return String(p || '')
     .trim()
@@ -108,7 +122,9 @@ export function initProxyModule() {
     toolSaveBtn: document.getElementById('proxyToolSaveBtn'),
     toolCancelBtn: document.getElementById('proxyToolCancelBtn'),
     cliToolsBody: document.getElementById('proxyCliToolsBody'),
-    cliMetaText: document.getElementById('proxyCliMetaText'),
+    cliPathText: document.getElementById('proxyCliPathText'),
+    shimDirText: document.getElementById('proxyShimDirText'),
+    shimPathTag: document.getElementById('proxyShimPathTag'),
 
     subViewControl: document.getElementById('proxySubViewControl'),
     tabConnBtn: document.getElementById('proxyTabConnBtn'),
@@ -256,6 +272,9 @@ export function initProxyModule() {
           : '';
         const idAttr = escapeHtml(tool.id);
 
+        const stopDisabled = state.busy || state.auditing || running === 0 ? 'disabled' : '';
+        const stopTitle = running > 0 ? '结束该工具进程' : '当前未运行';
+
         return `
           <tr>
             <td>
@@ -265,7 +284,7 @@ export function initProxyModule() {
                   ${argsTag}
                   ${dirTag}
                 </div>
-                <div class="cli-tool-path mono">${escapeHtml(tool.exePath)}</div>
+                <div class="cli-tool-path mono" title="${escapeHtml(tool.exePath)}">${escapeHtml(tool.exePath)}</div>
               </div>
             </td>
             <td><span class="tag mono">${modeLabel}</span></td>
@@ -273,9 +292,9 @@ export function initProxyModule() {
             <td>
               <div class="cli-tool-actions">
                 <button type="button" class="${launchClass} cli-tool-launch-btn" data-tool-id="${idAttr}" ${disabledAttr}>${launchLabel}</button>
-                <button type="button" class="btn btn-danger-subtle cli-tool-stop-btn" data-tool-id="${idAttr}" ${disabledAttr}>结束</button>
+                <button type="button" class="btn cli-tool-stop-btn" data-tool-id="${idAttr}" ${stopDisabled} title="${stopTitle}">结束</button>
                 <button type="button" class="btn cli-tool-edit-btn" data-tool-id="${idAttr}">编辑</button>
-                <button type="button" class="btn cli-tool-del-btn" data-tool-id="${idAttr}">删除</button>
+                <button type="button" class="btn btn-danger-subtle cli-tool-del-btn" data-tool-id="${idAttr}">删除</button>
               </div>
             </td>
           </tr>
@@ -439,10 +458,35 @@ export function initProxyModule() {
     if (els.btnStopCli) {
       els.btnStopCli.classList.toggle('hidden', cliProcs === 0);
     }
-    if (els.cliMetaText) {
-      const cliText = shim.cliPath || '未检测到（请在「设置」配置或点击「重新探测」）';
-      const shimState = shim.enabled ? '已加入用户 PATH' : '未加入 PATH';
-      els.cliMetaText.textContent = `CLI: ${cliText} · Shim 目录: ${shim.shimDir || '—'} (${shimState})`;
+    if (els.cliPathText) {
+      if (shim.cliPath) {
+        els.cliPathText.textContent = compactDisplayPath(shim.cliPath, 64);
+        els.cliPathText.title = `${shim.cliPath}（点击复制完整路径）`;
+        els.cliPathText.dataset.fullPath = shim.cliPath;
+        els.cliPathText.classList.add('acc-copyable');
+      } else {
+        els.cliPathText.textContent = '未检测到（可在「设置」配置或重新探测）';
+        els.cliPathText.title = '';
+        delete els.cliPathText.dataset.fullPath;
+        els.cliPathText.classList.remove('acc-copyable');
+      }
+    }
+    if (els.shimDirText) {
+      if (shim.shimDir) {
+        els.shimDirText.textContent = compactDisplayPath(shim.shimDir, 42);
+        els.shimDirText.title = `${shim.shimDir}（点击复制完整路径）`;
+        els.shimDirText.dataset.fullPath = shim.shimDir;
+        els.shimDirText.classList.add('acc-copyable');
+      } else {
+        els.shimDirText.textContent = '—';
+        els.shimDirText.title = '';
+        delete els.shimDirText.dataset.fullPath;
+        els.shimDirText.classList.remove('acc-copyable');
+      }
+    }
+    if (els.shimPathTag) {
+      els.shimPathTag.textContent = shim.enabled ? '已加入 PATH' : '未加入 PATH';
+      els.shimPathTag.className = shim.enabled ? 'tag mono tag-ok' : 'tag mono';
     }
 
     renderCliTools();
@@ -1166,6 +1210,24 @@ export function initProxyModule() {
   els.btnClearLog.addEventListener('click', () => {
     state.logs = [];
     els.logPre.textContent = '';
+  });
+
+  [els.cliPathText, els.shimDirText].filter(Boolean).forEach((el) => {
+    el.addEventListener('click', async () => {
+      const fullPath = el.dataset.fullPath;
+      if (!fullPath) return;
+      try {
+        await navigator.clipboard.writeText(fullPath);
+        const orig = el.textContent;
+        el.textContent = '已复制路径';
+        appendLog(`[OK] 已复制路径: ${fullPath}`);
+        setTimeout(() => {
+          if (el.textContent === '已复制路径') el.textContent = orig;
+        }, 1200);
+      } catch {
+        appendLog(`[!] 无法写入剪贴板: ${fullPath}`);
+      }
+    });
   });
 
   let initialized = false;

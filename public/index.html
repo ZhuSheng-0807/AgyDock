@@ -513,13 +513,13 @@
       </div>
 
       <div class="table-wrap">
-        <table class="data-table">
+        <table class="data-table cli-tools-table">
           <thead>
             <tr>
               <th>工具与路径</th>
-              <th style="width: 148px;">代理模式</th>
-              <th style="width: 112px;">运行状态</th>
-              <th style="width: 248px;">操作</th>
+              <th style="width: 132px;">代理模式</th>
+              <th style="width: 96px;">运行状态</th>
+              <th style="width: 244px;">操作</th>
             </tr>
           </thead>
           <tbody id="proxyCliToolsBody">
@@ -528,8 +528,17 @@
         </table>
       </div>
 
-      <div class="cli-shim-bar mono" id="proxyCliMetaBar">
-        <span id="proxyCliMetaText">CLI: 检测中...</span>
+      <div class="cli-shim-bar" id="proxyCliMetaBar">
+        <div class="cli-meta-item">
+          <span class="cli-meta-label">CLI</span>
+          <span class="cli-meta-path mono" id="proxyCliPathText" title="">检测中...</span>
+        </div>
+        <span class="cli-meta-divider" aria-hidden="true"></span>
+        <div class="cli-meta-item cli-meta-item-shim">
+          <span class="cli-meta-label">Shim</span>
+          <span class="cli-meta-path mono" id="proxyShimDirText" title="">—</span>
+          <span class="tag mono" id="proxyShimPathTag">未加入 PATH</span>
+        </div>
       </div>
     </section>
 
