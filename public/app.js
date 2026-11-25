@@ -9,6 +9,7 @@ import {
 } from './charts.js';
 import { initProxyModule } from './proxy.js';
 import { initAccountsModule } from './accounts.js';
+import { initUsageQuotaPanel } from './quota.js';
 
 const tauriInvoke =
   typeof window !== 'undefined' && typeof window.__TAURI__?.core?.invoke === 'function'
@@ -1171,6 +1172,7 @@ resizeObserver.observe(els.cacheChartStage);
 // Desktop module switcher (用量看板 | 隔离代理 | 账号)
 const proxyModule = initProxyModule();
 const accountsModule = initAccountsModule();
+const quotaPanel = initUsageQuotaPanel();
 const previewTab = new URLSearchParams(window.location.search).get('preview');
 const accountTabAllowed = isDesktopApp;
 const tabBarVisible = isDesktopApp || previewTab === 'proxy';
@@ -1196,6 +1198,7 @@ function switchPrimaryTab(tab) {
 
   proxyModule.setActive(next === 'proxy');
   accountsModule.setActive(next === 'accounts');
+  quotaPanel.setActive(isUsage);
   if (isUsage) {
     renderCharts();
   }

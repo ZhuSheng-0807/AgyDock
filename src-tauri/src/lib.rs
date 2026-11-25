@@ -1,9 +1,12 @@
 mod accounts;
 mod credential;
 mod proxy;
+mod quota;
 mod scanner;
 
 use accounts::{AccountEntry, AccountHealth, AccountStore, AccountsList, CurrentCredential};
+use quota::{AccountQuotaSnapshot, QuotaCacheStore, TokenCache};
+use std::collections::HashMap;
 use proxy::{
     build_cli_shell_snippets, build_dry_run_preview, build_snapshot, detect_cli_and_tools,
     disable_cli_shim, enable_cli_shim, flush_dns_cache, get_antigravity_runtime_status,
@@ -31,6 +34,8 @@ struct AppState {
     scanner: Mutex<BrainScanner>,
     proxy_settings: Mutex<ProxySettings>,
     account_lock: Arc<Mutex<()>>,
+    quota_token_cache: Arc<Mutex<TokenCache>>,
+    quota_cache_lock: Arc<Mutex<()>>,
     tray_signature: Mutex<String>,
     audit_cancel: Arc<AtomicBool>,
     audit_running: Arc<AtomicBool>,
@@ -930,6 +935,269 @@ async fn accounts_switch(
     Ok(res)
 }
 
+// ------------------------- Quota & Plan Tier Commands -------------------------
+
+#[tauri::command]
+async fn quota_get_cached(
+    state: State<'_, AppState>,
+) -> Result<HashMap<String, AccountQuotaSnapshot>, String> {
+    let lock = Arc::clone(&state.quota_cache_lock);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock.lock().map_err(|_| "Quota cache lock poisoned")?;
+        Ok(QuotaCacheStore::default_store().load_all())
+    })
+    .await
+    .map_err(|e| format!("Quota cache load failed: {e}"))?
+}
+
+fn collect_live_token_blobs(include_cred_mgr: bool) -> Vec<Vec<u8>> {
+    let mut blobs = credential::read_local_token_file_blobs();
+    if include_cred_mgr {
+        if let Ok(Some(blob)) = credential::read_blob() {
+            blobs.push(blob);
+        }
+    }
+    blobs
+}
+
+#[tauri::command]
+async fn quota_fetch_current(
+    state: State<'_, AppState>,
+    force_refresh: Option<bool>,
+) -> Result<AccountQuotaSnapshot, String> {
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+    let token_cache = Arc::clone(&state.quota_token_cache);
+    let cache_lock = Arc::clone(&state.quota_cache_lock);
+    let account_lock = Arc::clone(&state.account_lock);
+    let force = force_refresh.unwrap_or(false);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let local_file_blobs = credential::read_local_token_file_blobs();
+        let cred_mgr_blob = credential::read_blob()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let blob = match cred_mgr_blob
+            .or_else(|| credential::pick_freshest_any_blob(&local_file_blobs, now_ms))
+        {
+            Some(b) => b,
+            None => {
+                return Ok(AccountQuotaSnapshot {
+                    error: Some("当前未登录 Antigravity 账号，请先登录或切换账号".to_string()),
+                    ..Default::default()
+                });
+            }
+        };
+
+        let info = credential::parse_blob(&blob);
+        let account_id = info.email.as_deref().and_then(|email| {
+            let _guard = account_lock.lock().ok()?;
+            AccountStore::default_store()
+                .list_readonly(Some(email))
+                .into_iter()
+                .find(|a| a.email.eq_ignore_ascii_case(email))
+                .map(|a| a.id)
+        });
+
+        let cached_map = {
+            let _guard = cache_lock
+                .lock()
+                .map_err(|_| "Quota cache lock poisoned")?;
+            QuotaCacheStore::default_store().load_all()
+        };
+
+        let snap = quota::fetch_quota_for_blob(
+            &blob,
+            &local_file_blobs,
+            account_id,
+            &settings,
+            &token_cache,
+            &cached_map,
+            force,
+        );
+
+        if snap.error.is_none() {
+            let _guard = cache_lock
+                .lock()
+                .map_err(|_| "Quota cache lock poisoned")?;
+            let _ = QuotaCacheStore::default_store().upsert(&snap);
+        }
+
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("Quota fetch current failed: {e}"))?
+}
+
+#[tauri::command]
+async fn quota_fetch_account(
+    state: State<'_, AppState>,
+    id: String,
+    force_refresh: Option<bool>,
+) -> Result<AccountQuotaSnapshot, String> {
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+    let token_cache = Arc::clone(&state.quota_token_cache);
+    let cache_lock = Arc::clone(&state.quota_cache_lock);
+    let account_lock = Arc::clone(&state.account_lock);
+    let force = force_refresh.unwrap_or(true);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let (entry, blob) = {
+            let _guard = account_lock
+                .lock()
+                .map_err(|_| "Account store lock poisoned")?;
+            let store = AccountStore::default_store();
+            let entry = store
+                .get(&id)
+                .ok_or_else(|| "账号不存在或已被删除".to_string())?;
+            let blob = store.load_blob(&id)?;
+            (entry, blob)
+        };
+
+        let live_blobs = collect_live_token_blobs(true);
+
+        let cached_map = {
+            let _guard = cache_lock
+                .lock()
+                .map_err(|_| "Quota cache lock poisoned")?;
+            QuotaCacheStore::default_store().load_all()
+        };
+
+        let mut snap = quota::fetch_quota_for_blob(
+            &blob,
+            &live_blobs,
+            Some(entry.id.clone()),
+            &settings,
+            &token_cache,
+            &cached_map,
+            force,
+        );
+        if snap.email == "unknown" && !entry.email.is_empty() {
+            snap.email = entry.email;
+        }
+
+        if snap.error.is_none() {
+            let _guard = cache_lock
+                .lock()
+                .map_err(|_| "Quota cache lock poisoned")?;
+            let _ = QuotaCacheStore::default_store().upsert(&snap);
+        }
+
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("Quota fetch account failed: {e}"))?
+}
+
+#[tauri::command]
+async fn quota_fetch_all(state: State<'_, AppState>) -> Result<Vec<AccountQuotaSnapshot>, String> {
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+    let token_cache = Arc::clone(&state.quota_token_cache);
+    let cache_lock = Arc::clone(&state.quota_cache_lock);
+    let account_lock = Arc::clone(&state.account_lock);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let cached_map = {
+            let _guard = cache_lock
+                .lock()
+                .map_err(|_| "Quota cache lock poisoned")?;
+            QuotaCacheStore::default_store().load_all()
+        };
+
+        let mut jobs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+        let mut pre_errors: Vec<AccountQuotaSnapshot> = Vec::new();
+        let mut seen_emails: Vec<String> = Vec::new();
+
+        {
+            let _guard = account_lock
+                .lock()
+                .map_err(|_| "Account store lock poisoned")?;
+            let store = AccountStore::default_store();
+            let list = store.list_and_sync()?;
+            for acc in list.accounts {
+                seen_emails.push(acc.email.to_ascii_lowercase());
+                match store.load_blob(&acc.id) {
+                    Ok(blob) => jobs.push((Some(acc.id), blob)),
+                    Err(err) => {
+                        let key = acc.email.to_ascii_lowercase();
+                        pre_errors.push(quota::error_snapshot_with_fallback(
+                            acc.email,
+                            Some(acc.id),
+                            None,
+                            err,
+                            cached_map.get(&key).cloned(),
+                        ));
+                    }
+                }
+            }
+            if let Ok(Some(cur_blob)) = credential::read_blob() {
+                if let Some(cur_email) = credential::parse_blob(&cur_blob).email {
+                    let lower = cur_email.trim().to_ascii_lowercase();
+                    if !seen_emails.iter().any(|e| e == &lower) {
+                        jobs.push((None, cur_blob));
+                    }
+                }
+            }
+        }
+
+        let live_blobs = collect_live_token_blobs(true);
+        let mut results =
+            quota::fetch_all_accounts_quota(jobs, &live_blobs, &settings, &token_cache, &cached_map);
+        results.extend(pre_errors);
+
+        {
+            let _guard = cache_lock
+                .lock()
+                .map_err(|_| "Quota cache lock poisoned")?;
+            let _ = QuotaCacheStore::default_store().upsert_many(&results);
+        }
+
+        Ok(results)
+    })
+    .await
+    .map_err(|e| format!("Quota fetch all failed: {e}"))?
+}
+
+#[tauri::command]
+async fn quota_oauth_config_status() -> Result<quota::OAuthClientStatus, String> {
+    tauri::async_runtime::spawn_blocking(quota::get_oauth_client_status)
+        .await
+        .map_err(|e| format!("Load OAuth config status failed: {e}"))
+}
+
+#[tauri::command]
+async fn quota_oauth_config_save(
+    client_id: String,
+    client_secret: String,
+) -> Result<quota::OAuthClientStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        quota::save_oauth_client_config(&client_id, &client_secret)
+    })
+    .await
+    .map_err(|e| format!("Save OAuth config failed: {e}"))?
+}
+
+#[tauri::command]
+async fn quota_oauth_config_clear() -> Result<quota::OAuthClientStatus, String> {
+    tauri::async_runtime::spawn_blocking(quota::clear_oauth_client_config)
+        .await
+        .map_err(|e| format!("Clear OAuth config failed: {e}"))?
+}
+
 // ------------------------- Isolated Proxy Commands -------------------------
 
 #[tauri::command]
@@ -1545,6 +1813,8 @@ pub fn run() {
             scanner: Mutex::new(initial_scanner),
             proxy_settings: Mutex::new(initial_proxy_settings),
             account_lock: Arc::new(Mutex::new(())),
+            quota_token_cache: Arc::new(Mutex::new(TokenCache::new())),
+            quota_cache_lock: Arc::new(Mutex::new(())),
             tray_signature: Mutex::new(String::new()),
             audit_cancel: Arc::new(AtomicBool::new(false)),
             audit_running: Arc::new(AtomicBool::new(false)),
@@ -1650,6 +1920,13 @@ pub fn run() {
             accounts_begin_login,
             accounts_logout,
             accounts_switch,
+            quota_get_cached,
+            quota_fetch_current,
+            quota_fetch_account,
+            quota_fetch_all,
+            quota_oauth_config_status,
+            quota_oauth_config_save,
+            quota_oauth_config_clear,
             proxy_get_settings,
             proxy_save_settings,
             proxy_get_snapshot,

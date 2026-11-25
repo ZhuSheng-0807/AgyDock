@@ -77,6 +77,9 @@
         <button type="button" class="btn btn-danger-subtle" id="accountLogoutBtn" title="备份当前账号后退出登录（本地备份仍会保留）">
           退出登录
         </button>
+        <button type="button" class="btn" id="accountQuotaAllBtn" title="查询全部已保存账号的套餐等级、剩余额度与刷新时间">
+          刷新全部额度
+        </button>
         <button type="button" class="btn" id="accountRefreshBtn">
           刷新
         </button>
@@ -125,6 +128,30 @@
         <div class="kpi-label">活跃会话 (Sessions)</div>
         <div class="kpi-value mono" id="kpiSessions">—</div>
         <div class="kpi-sub mono" id="kpiSessionsSub">—</div>
+      </div>
+    </section>
+
+    <!-- Row 1.2: Active Account Plan & Quota (Desktop) -->
+    <section class="panel hidden" id="quotaPanel" aria-label="套餐与剩余额度">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">套餐与剩余额度</h2>
+          <span class="quota-tier-badge-group" id="quotaTierBadge"></span>
+          <span class="panel-note mono" id="quotaAccountEmail">—</span>
+          <span class="tag hidden" id="quotaCreditsTag"></span>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="btn hidden" id="quotaToggleModelsBtn">模型明细</button>
+          <button type="button" class="btn" id="quotaRefreshBtn" title="刷新当前登录账号的套餐等级与模型剩余额度">刷新额度</button>
+        </div>
+      </div>
+      <div class="quota-panel-body" id="quotaPoolsStage">
+        <div class="quota-empty">正在读取套餐与剩余额度...</div>
+      </div>
+      <div class="quota-models-wrap hidden" id="quotaModelsWrap"></div>
+      <div class="quota-meta-bar mono">
+        <span id="quotaMetaLeft">—</span>
+        <span id="quotaMetaRight">—</span>
       </div>
     </section>
 
@@ -595,6 +622,7 @@
         <div class="kpi-value kpi-value-sm">
           <span class="status-dot muted" id="accCurrentDot"></span>
           <span class="mono acc-email-value acc-copyable" id="accCurrentEmail" title="点击复制邮箱">—</span>
+          <span id="accCurrentTierBadge"></span>
         </div>
         <div class="kpi-sub mono" id="accCurrentSub">—</div>
       </div>
@@ -615,6 +643,42 @@
         <div class="kpi-label">最近切换</div>
         <div class="kpi-value kpi-value-sm mono" id="accLastUsed">—</div>
         <div class="kpi-sub mono" id="accLastUsedSub">—</div>
+      </div>
+    </section>
+
+    <section class="panel hidden" id="accountOAuthPanel" aria-label="离线续期配置">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">离线续期配置 (可选)</h2>
+          <span class="tag mono" id="accountOAuthStatusTag">未配置</span>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="btn" id="accountOAuthCloseBtn">收起</button>
+        </div>
+      </div>
+      <div class="settings-grid">
+        <div class="field-row">
+          <span class="field-label">说明</span>
+          <span class="panel-note">活跃中的 Antigravity / T3 Code / agy CLI 令牌会自动复用，无需配置。仅当未启动客户端的离线账号 access_token 已过期时才需要；凭据使用 Windows DPAPI 加密存于本机。</span>
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="accountOAuthClientId">Client ID</label>
+          <div class="field-path">
+            <input type="text" id="accountOAuthClientId" class="text-input mono flex-1" placeholder="粘贴 OAuth Client ID（可选）" autocomplete="off" />
+          </div>
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="accountOAuthClientSecret">Client Secret</label>
+          <div class="field-path">
+            <input type="password" id="accountOAuthClientSecret" class="text-input mono flex-1" placeholder="粘贴 OAuth Client Secret（保存时经 DPAPI 加密，不回显原文）" autocomplete="off" />
+            <button type="button" class="btn btn-primary" id="accountOAuthSaveBtn">保存配置</button>
+            <button type="button" class="btn btn-danger-subtle hidden" id="accountOAuthClearBtn">清除配置</button>
+          </div>
+        </div>
+        <div class="field-row">
+          <span class="field-label">存储路径</span>
+          <span class="panel-note mono" id="accountOAuthPathNote">—</span>
+        </div>
       </div>
     </section>
 
@@ -639,6 +703,7 @@
           />
           <select id="accountSort" class="select-input">
             <option value="default">默认排序</option>
+            <option value="quota">按剩余额度</option>
             <option value="recent">按最近使用</option>
             <option value="switches">按切换次数</option>
             <option value="saved">按保存时间</option>
@@ -646,6 +711,7 @@
           </select>
           <button type="button" class="btn" id="accountVerifyBtn" title="使用 DPAPI 解密检验全部本地凭据备份是否完好">校验备份</button>
           <button type="button" class="btn" id="accountOpenDirBtn" title="在资源管理器中打开加密备份目录">打开目录</button>
+          <button type="button" class="btn" id="accountOAuthBtn" title="可选：配置本地 DPAPI 加密 OAuth 刷新凭据，用于多账号离线自动续期">离线续期</button>
         </div>
       </div>
       <div class="table-wrap">
@@ -653,14 +719,15 @@
           <thead>
             <tr>
               <th>账号</th>
-              <th style="width: 152px;">备注</th>
-              <th style="width: 138px;">使用记录</th>
-              <th style="width: 156px;">凭据状态</th>
-              <th style="width: 248px;">操作</th>
+              <th style="width: 236px;">套餐与额度</th>
+              <th style="width: 140px;">备注</th>
+              <th style="width: 132px;">使用记录</th>
+              <th style="width: 146px;">凭据状态</th>
+              <th style="width: 288px;">操作</th>
             </tr>
           </thead>
           <tbody id="accountsTableBody">
-            <tr class="empty-row"><td colspan="5">正在读取账号...</td></tr>
+            <tr class="empty-row"><td colspan="6">正在读取账号...</td></tr>
           </tbody>
         </table>
       </div>

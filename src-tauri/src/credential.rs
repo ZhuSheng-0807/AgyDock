@@ -163,6 +163,234 @@ pub fn parse_blob(blob: &[u8]) -> CredentialInfo {
     info
 }
 
+/// 内部使用的凭据令牌结构：绝不派生 Serialize，Debug 输出对令牌脱敏。
+#[derive(Clone, Default)]
+pub(crate) struct CredentialTokens {
+    pub email: Option<String>,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub expires_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for CredentialTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialTokens")
+            .field("email", &self.email)
+            .field("access_token", &self.access_token.as_ref().map(|_| "[REDACTED]"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+/// 从凭据 blob 中提取 OAuth 令牌（仅供后端发起额度查询使用）。
+pub(crate) fn extract_tokens(blob: &[u8]) -> CredentialTokens {
+    let info = parse_blob(blob);
+    let mut out = CredentialTokens {
+        email: info.email,
+        access_token: None,
+        refresh_token: None,
+        expires_at_ms: info.expires_at_ms,
+    };
+    let text = String::from_utf8_lossy(blob);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return out;
+    };
+
+    let non_empty_str = |v: Option<&serde_json::Value>| -> Option<String> {
+        v.and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let token = value.get("token");
+    out.access_token = token
+        .and_then(|t| non_empty_str(t.get("access_token")))
+        .or_else(|| non_empty_str(value.get("access_token")));
+    out.refresh_token = token
+        .and_then(|t| non_empty_str(t.get("refresh_token")))
+        .or_else(|| non_empty_str(value.get("refresh_token")));
+
+    out
+}
+
+const MAX_LOCAL_TOKEN_FILE_BYTES: u64 = 256 * 1024;
+
+/// 发现本机各 Antigravity 客户端（Desktop App / CLI / T3 Code ACP）保存的 `antigravity-oauth-token` 文件路径。
+pub(crate) fn discover_local_token_file_paths(
+    home: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Some(h) = home else {
+        return out;
+    };
+
+    let candidates = [
+        h.join(".gemini")
+            .join("antigravity")
+            .join("antigravity-oauth-token"),
+        h.join(".gemini")
+            .join("antigravity-cli")
+            .join("antigravity-oauth-token"),
+    ];
+    for p in candidates {
+        if p.is_file() {
+            out.push(p);
+        }
+    }
+
+    let t3_root = h
+        .join(".t3")
+        .join("userdata")
+        .join("providers")
+        .join("antigravity");
+    if let Ok(entries) = std::fs::read_dir(&t3_root) {
+        let mut subdirs: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        subdirs.sort();
+        for sub in subdirs {
+            let p = sub.join("antigravity-acp").join("antigravity-oauth-token");
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+
+    out
+}
+
+/// 只读读取本机 Antigravity 客户端保存的 OAuth 令牌文件原始内容（单文件上限 256 KiB）。
+pub(crate) fn read_local_token_file_blobs() -> Vec<Vec<u8>> {
+    use std::io::Read;
+
+    let mut blobs = Vec::new();
+    for path in discover_local_token_file_paths(dirs::home_dir().as_deref()) {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if file
+            .take(MAX_LOCAL_TOKEN_FILE_BYTES)
+            .read_to_end(&mut buf)
+            .is_ok()
+            && !buf.is_empty()
+        {
+            blobs.push(buf);
+        }
+    }
+    blobs
+}
+
+fn is_candidate_access_fresher(
+    cand: &CredentialTokens,
+    best: &CredentialTokens,
+    now_ms: i64,
+) -> bool {
+    if cand.access_token.is_none() {
+        return false;
+    }
+    if best.access_token.is_none() {
+        return true;
+    }
+    match (cand.expires_at_ms, best.expires_at_ms) {
+        (Some(c), Some(b)) => c > b,
+        (Some(c), None) => c > now_ms,
+        (None, Some(b)) => b <= now_ms,
+        (None, None) => false,
+    }
+}
+
+/// 在多个凭据来源中为同邮箱账号挑选最新鲜的 access_token / refresh_token。
+pub(crate) fn select_freshest_tokens(
+    primary: &CredentialTokens,
+    extra_blobs: &[Vec<u8>],
+    target_email: Option<&str>,
+    now_ms: i64,
+) -> CredentialTokens {
+    let match_email = target_email
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .or_else(|| {
+            primary
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_ascii_lowercase())
+        });
+
+    let mut best = primary.clone();
+    for blob in extra_blobs {
+        let cand = extract_tokens(blob);
+        if let Some(ref target) = match_email {
+            let Some(cand_email) = cand.email.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if !cand_email.eq_ignore_ascii_case(target) {
+                continue;
+            }
+        }
+
+        if best.email.is_none() {
+            best.email = cand.email.clone();
+        }
+        if best.refresh_token.is_none() {
+            best.refresh_token = cand.refresh_token.clone();
+        }
+        if is_candidate_access_fresher(&cand, &best, now_ms) {
+            best.access_token = cand.access_token;
+            best.expires_at_ms = cand.expires_at_ms;
+            if cand.refresh_token.is_some() {
+                best.refresh_token = cand.refresh_token;
+            }
+        }
+    }
+
+    best
+}
+
+/// 当系统凭据管理器缺失时，从本地客户端令牌文件中挑选最新鲜且含邮箱的有效 blob。
+pub(crate) fn pick_freshest_any_blob(blobs: &[Vec<u8>], now_ms: i64) -> Option<Vec<u8>> {
+    blobs
+        .iter()
+        .filter_map(|blob| {
+            let tok = extract_tokens(blob);
+            let has_email = tok
+                .email
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            if !has_email || (tok.access_token.is_none() && tok.refresh_token.is_none()) {
+                return None;
+            }
+            let has_access = tok.access_token.is_some();
+            let has_unexpired = has_access
+                && tok
+                    .expires_at_ms
+                    .map(|exp| exp > now_ms)
+                    .unwrap_or(true);
+            let rank = (
+                has_unexpired,
+                tok.expires_at_ms.unwrap_or(i64::MIN),
+                has_access,
+            );
+            Some((rank, blob))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, blob)| blob.clone())
+}
+
 /// 读取当前登录凭据的原始 blob；未登录时返回 `Ok(None)`。
 pub fn read_blob() -> Result<Option<Vec<u8>>, String> {
     sys::read_blob(TARGET)
@@ -469,5 +697,97 @@ mod tests {
     #[cfg(windows)]
     fn delete_for_test(target: &str) -> Result<bool, String> {
         super::sys::delete(target)
+    }
+
+    #[test]
+    fn extract_tokens_parses_nested_and_top_level_and_redacts_debug() {
+        let nested = br#"{"token":{"access_token":"  ya29.secret-abc  ","refresh_token":"1//refresh-xyz","expiry":"2026-11-20T11:33:36+08:00"},"id_token_email":"user@example.com"}"#;
+        let t1 = extract_tokens(nested);
+        assert_eq!(t1.email.as_deref(), Some("user@example.com"));
+        assert_eq!(t1.access_token.as_deref(), Some("ya29.secret-abc"));
+        assert_eq!(t1.refresh_token.as_deref(), Some("1//refresh-xyz"));
+        assert_eq!(t1.expires_at_ms, Some(1795145616000));
+        let dbg = format!("{t1:?}");
+        assert!(!dbg.contains("ya29.secret-abc"));
+        assert!(!dbg.contains("1//refresh-xyz"));
+        assert!(dbg.contains("[REDACTED]"));
+
+        let top = br#"{"access_token":"top-access","refresh_token":"","email":"top@example.com"}"#;
+        let t2 = extract_tokens(top);
+        assert_eq!(t2.email.as_deref(), Some("top@example.com"));
+        assert_eq!(t2.access_token.as_deref(), Some("top-access"));
+        assert!(t2.refresh_token.is_none());
+
+        let garbage = extract_tokens(b"not-json");
+        assert!(garbage.access_token.is_none());
+        assert!(garbage.refresh_token.is_none());
+    }
+
+    #[test]
+    fn discovers_local_token_files_and_selects_freshest_same_email_tokens() {
+        let base = std::env::temp_dir().join(format!(
+            "agydock-cred-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let app_tok = base
+            .join(".gemini")
+            .join("antigravity")
+            .join("antigravity-oauth-token");
+        let t3_tok = base
+            .join(".t3")
+            .join("userdata")
+            .join("providers")
+            .join("antigravity")
+            .join("profile-a")
+            .join("antigravity-acp")
+            .join("antigravity-oauth-token");
+        std::fs::create_dir_all(app_tok.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(t3_tok.parent().unwrap()).unwrap();
+        std::fs::write(&app_tok, b"{}").unwrap();
+        std::fs::write(&t3_tok, b"{}").unwrap();
+
+        let paths = discover_local_token_file_paths(Some(&base));
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&app_tok));
+        assert!(paths.contains(&t3_tok));
+
+        let primary_blob = br#"{"token":{"access_token":"old-acc","refresh_token":"old-ref","expiry":"2026-11-24T10:00:00Z"},"id_token_email":"user@example.com"}"#;
+        let other_user_blob = br#"{"token":{"access_token":"other-acc","refresh_token":"other-ref","expiry":"2026-11-26T10:00:00Z"},"id_token_email":"other@example.com"}"#.to_vec();
+        let fresher_same_blob = br#"{"token":{"access_token":"fresh-acc","expiry":"2026-11-25T10:00:00Z"},"id_token_email":"USER@example.com"}"#.to_vec();
+        let older_same_blob = br#"{"token":{"access_token":"older-acc","refresh_token":"older-ref","expiry":"2026-11-24T09:00:00Z"},"id_token_email":"user@example.com"}"#.to_vec();
+
+        let primary = extract_tokens(primary_blob);
+        let selected = select_freshest_tokens(
+            &primary,
+            &[other_user_blob.clone(), fresher_same_blob.clone(), older_same_blob],
+            None,
+            1_795_400_000_000,
+        );
+        assert_eq!(selected.access_token.as_deref(), Some("fresh-acc"));
+        assert_eq!(selected.refresh_token.as_deref(), Some("old-ref"));
+        assert!(selected.expires_at_ms > primary.expires_at_ms);
+
+        // When primary is already fresher, keep primary
+        let selected_keep = select_freshest_tokens(
+            &extract_tokens(&fresher_same_blob),
+            &[primary_blob.to_vec()],
+            None,
+            1_795_400_000_000,
+        );
+        assert_eq!(selected_keep.access_token.as_deref(), Some("fresh-acc"));
+        assert_eq!(selected_keep.refresh_token.as_deref(), Some("old-ref"));
+
+        // pick_freshest_any_blob picks unexpired over expired
+        let expired_blob = primary_blob.to_vec();
+        let unexpired_blob = br#"{"token":{"access_token":"live-acc","expiry":"2099-01-01T00:00:00Z"},"id_token_email":"live@example.com"}"#.to_vec();
+        let picked = pick_freshest_any_blob(&[expired_blob, unexpired_blob], 1_800_000_000_000).unwrap();
+        assert_eq!(extract_tokens(&picked).email.as_deref(), Some("live@example.com"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1,3 +1,14 @@
+import {
+  formatCreditsSummary,
+  formatRemainingPct,
+  formatResetCountdown,
+  formatResetExact,
+  normalizeEmailKey,
+  quotaToneClass,
+  renderQuotaDetailHtml,
+  tierBadgeHtml,
+} from './quota.js';
+
 const tauriInvoke =
   typeof window !== 'undefined' && typeof window.__TAURI__?.core?.invoke === 'function'
     ? window.__TAURI__.core.invoke
@@ -11,6 +22,8 @@ const tauriListen =
 const WAIT_TIMEOUT_MS = 300_000;
 const ACTIVE_REFRESH_MS = 5_000;
 const LOGIN_POLL_MS = 1_200;
+const QUOTA_STALE_MS = 180_000;
+const QUOTA_TICK_MS = 30_000;
 const RESTART_PREF_KEY = 'agydock_accounts_restart';
 
 function escapeHtml(str) {
@@ -99,6 +112,7 @@ export function initAccountsModule() {
     addBtn: document.getElementById('accountAddBtn'),
     saveBtn: document.getElementById('accountSaveBtn'),
     logoutBtn: document.getElementById('accountLogoutBtn'),
+    quotaAllBtn: document.getElementById('accountQuotaAllBtn'),
     refreshBtn: document.getElementById('accountRefreshBtn'),
     detectSaveBtn: document.getElementById('accountDetectSaveBtn'),
 
@@ -118,6 +132,7 @@ export function initAccountsModule() {
 
     currentDot: document.getElementById('accCurrentDot'),
     currentEmail: document.getElementById('accCurrentEmail'),
+    currentTierBadge: document.getElementById('accCurrentTierBadge'),
     currentSub: document.getElementById('accCurrentSub'),
     count: document.getElementById('accCount'),
     countSub: document.getElementById('accCountSub'),
@@ -133,6 +148,15 @@ export function initAccountsModule() {
     sortSelect: document.getElementById('accountSort'),
     verifyBtn: document.getElementById('accountVerifyBtn'),
     openDirBtn: document.getElementById('accountOpenDirBtn'),
+    oauthBtn: document.getElementById('accountOAuthBtn'),
+    oauthPanel: document.getElementById('accountOAuthPanel'),
+    oauthStatusTag: document.getElementById('accountOAuthStatusTag'),
+    oauthCloseBtn: document.getElementById('accountOAuthCloseBtn'),
+    oauthClientId: document.getElementById('accountOAuthClientId'),
+    oauthClientSecret: document.getElementById('accountOAuthClientSecret'),
+    oauthSaveBtn: document.getElementById('accountOAuthSaveBtn'),
+    oauthClearBtn: document.getElementById('accountOAuthClearBtn'),
+    oauthPathNote: document.getElementById('accountOAuthPathNote'),
     tableBody: document.getElementById('accountsTableBody'),
 
     logCount: document.getElementById('accountLogCount'),
@@ -166,9 +190,14 @@ export function initAccountsModule() {
     renamingId: null,
     pendingConfirm: null,
     activeTimer: null,
+    countdownTimer: null,
     restartOnSwitch: loadRestartPref(),
     search: '',
     sort: 'default',
+    quotaMap: new Map(),
+    quotaLoadingIds: new Set(),
+    quotaFetchingAll: false,
+    expandedQuotaId: null,
     unlistenTray: null,
   };
 
@@ -251,12 +280,17 @@ export function initAccountsModule() {
     if (els.addBtn) els.addBtn.disabled = locked;
     if (els.saveBtn) els.saveBtn.disabled = locked;
     if (els.logoutBtn) els.logoutBtn.disabled = locked || !present;
+    if (els.quotaAllBtn) els.quotaAllBtn.disabled = locked || state.quotaFetchingAll;
     if (els.verifyBtn) els.verifyBtn.disabled = locked;
     if (els.refreshBtn) els.refreshBtn.disabled = busy;
 
     els.tableBody.querySelectorAll('button[data-act]').forEach((btn) => {
+      const act = btn.dataset.act;
       if (btn.dataset.locked === '1') {
         btn.disabled = true;
+      } else if (act === 'quota' || act === 'quota-refresh') {
+        btn.disabled =
+          locked || state.quotaFetchingAll || state.quotaLoadingIds.has(btn.dataset.id);
       } else {
         btn.disabled = locked;
       }
@@ -285,13 +319,24 @@ export function initAccountsModule() {
     els.currentEmail.classList.toggle('acc-copyable', Boolean(email));
     els.currentDot.className = 'status-dot';
     const currentEntry = accounts.find((a) => email && a.email === head(email));
+    const currentQuota = email ? state.quotaMap.get(normalizeEmailKey(email)) : null;
+    if (els.currentTierBadge) {
+      els.currentTierBadge.innerHTML =
+        present && currentQuota?.plan ? tierBadgeHtml(currentQuota.plan) : '';
+    }
     const remarkPrefix = currentEntry?.name ? `${currentEntry.name} · ` : '';
+    const quotaSuffix =
+      currentQuota && !currentQuota.error && currentQuota.minRemainingFraction != null
+        ? ` · 最低剩余 ${formatRemainingPct(currentQuota.minRemainingFraction)} (${formatResetCountdown(
+            currentQuota.earliestResetAtMs
+          )})`
+        : '';
     if (!present) {
       els.currentDot.classList.add('muted');
       els.currentSub.textContent = '请在 Antigravity 中登录，或点「添加账号」';
       els.currentSub.title = '';
     } else if (current.hasRefreshToken) {
-      els.currentSub.textContent = `${remarkPrefix}登录正常 · 含刷新令牌（支持自动续期）`;
+      els.currentSub.textContent = `${remarkPrefix}登录正常 · 含刷新令牌（支持自动续期）${quotaSuffix}`;
       els.currentSub.title = current.expiresAtMs
         ? `最近签发 access_token 状态: ${formatExpiryDelta(current.expiresAtMs)}（${formatDateTime(
             current.expiresAtMs
@@ -299,13 +344,13 @@ export function initAccountsModule() {
         : '';
     } else if (current.expired) {
       els.currentDot.classList.add('err');
-      els.currentSub.textContent = `${remarkPrefix}凭据已失效 · 缺少 refresh_token，需重新登录`;
+      els.currentSub.textContent = `${remarkPrefix}凭据已失效 · 缺少 refresh_token，需重新登录${quotaSuffix}`;
       els.currentSub.title = '';
     } else {
       els.currentDot.classList.add('warn');
       els.currentSub.textContent = `${remarkPrefix}临时凭据 (${formatExpiryDelta(
         current.expiresAtMs
-      )}) · 无刷新令牌`;
+      )}) · 无刷新令牌${quotaSuffix}`;
       els.currentSub.title = '';
     }
 
@@ -405,7 +450,15 @@ export function initAccountsModule() {
     }
 
     const sorted = [...list];
-    if (state.sort === 'recent') {
+    if (state.sort === 'quota') {
+      sorted.sort((a, b) => {
+        const qa = state.quotaMap.get(normalizeEmailKey(a.email));
+        const qb = state.quotaMap.get(normalizeEmailKey(b.email));
+        const fa = qa?.minRemainingFraction ?? -1;
+        const fb = qb?.minRemainingFraction ?? -1;
+        return fb - fa || a.email.localeCompare(b.email);
+      });
+    } else if (state.sort === 'recent') {
       sorted.sort((a, b) => (b.lastUsedAtMs || 0) - (a.lastUsedAtMs || 0));
     } else if (state.sort === 'switches') {
       sorted.sort(
@@ -421,12 +474,93 @@ export function initAccountsModule() {
     return sorted;
   }
 
+  function renderQuotaCellHtml(acc) {
+    const isLoading = state.quotaLoadingIds.has(acc.id) || (state.quotaFetchingAll && acc.backupOk !== false);
+    const snap = state.quotaMap.get(normalizeEmailKey(acc.email));
+
+    if (isLoading && !snap) {
+      return '<div class="quota-cell-empty mono">查询中...</div>';
+    }
+    if (!snap) {
+      return '<div class="quota-cell-empty mono">未查询 · 点击获取</div>';
+    }
+
+    const plan = snap.plan || {};
+    const creditsText = formatCreditsSummary(plan);
+    const loadingTag = isLoading ? '<span class="tag">查询中</span>' : '';
+    const errTag = snap.error
+      ? `<span class="tag tag-err" title="${escapeHtml(snap.error)}">查询异常</span>`
+      : '';
+    const topLine = `
+      <div class="quota-cell-top">
+        ${tierBadgeHtml(plan)}
+        <span class="quota-cell-plan" title="${escapeHtml(plan.tierLabel || '')}">${escapeHtml(
+          plan.tierLabel || ''
+        )}</span>
+        ${creditsText ? `<span class="tag">${escapeHtml(creditsText)}</span>` : ''}
+        ${loadingTag}
+        ${errTag}
+      </div>
+    `;
+
+    const pools = Array.isArray(snap.pools) ? snap.pools : [];
+    if (pools.length > 0) {
+      const minFrac = snap.minRemainingFraction;
+      const pctText = formatRemainingPct(minFrac);
+      const tone = quotaToneClass(minFrac);
+      const width =
+        minFrac === null || minFrac === undefined
+          ? 0
+          : Math.round(Math.max(0, Math.min(1, Number(minFrac))) * 100);
+      const resetText = formatResetCountdown(snap.earliestResetAtMs);
+      const resetTitle = snap.earliestResetAtMs
+        ? `最近刷新: ${formatResetExact(snap.earliestResetAtMs)}`
+        : '';
+      const poolSummary = pools
+        .slice(0, 3)
+        .map((p) => {
+          const shortName = p.label
+            .replace('Gemini ', '')
+            .replace(' 模型', '')
+            .replace('Claude / GPT', '3P');
+          return `${shortName} ${formatRemainingPct(p.remainingFraction)}`;
+        })
+        .join(' · ');
+
+      return `
+        ${topLine}
+        <div class="quota-mini-row" title="${escapeHtml(resetTitle)}">
+          <div class="quota-bar-track"><div class="quota-bar-fill tone-${tone}" style="width:${width}%"></div></div>
+          <span class="quota-mini-pct mono tone-${tone}">${pctText}</span>
+          <span class="quota-mini-reset mono">${escapeHtml(resetText)}</span>
+        </div>
+        <div class="quota-cell-sub mono" title="${escapeHtml(
+          pools.map((p) => `${p.label}: ${formatRemainingPct(p.remainingFraction)}`).join(' · ')
+        )}">${escapeHtml(poolSummary)} · 点击查看明细</div>
+      `;
+    }
+
+    if (snap.error) {
+      return `
+        ${topLine}
+        <div class="quota-cell-sub tone-err" title="${escapeHtml(snap.error)}">${escapeHtml(
+          snap.error
+        )}</div>
+      `;
+    }
+
+    return `
+      ${topLine}
+      <div class="quota-cell-sub mono">暂无额度池 · 点击展开详情</div>
+    `;
+  }
+
   function renderTable(data) {
     const allAccounts = data.accounts || [];
     const accounts = getFilteredSortedAccounts(allAccounts);
 
     if (!allAccounts.length) {
-      els.tableBody.innerHTML = `<tr class="empty-row"><td colspan="5">${
+      els.tableBody.innerHTML = `<tr class="empty-row"><td colspan="6">${
         data.current?.present
           ? '当前登录账号尚未归档（可能曾被移除），请点击上方「重新归档」或「保存当前账号」'
           : '还没有保存的账号 · 点击右上角「添加账号」登录一次即可永久免登录切换'
@@ -437,7 +571,7 @@ export function initAccountsModule() {
 
     if (!accounts.length) {
       els.tableBody.innerHTML =
-        '<tr class="empty-row"><td colspan="5">没有匹配筛选条件的账号</td></tr>';
+        '<tr class="empty-row"><td colspan="6">没有匹配筛选条件的账号</td></tr>';
       els.listNote.textContent = `筛选匹配 0 / ${allAccounts.length} 个账号`;
       return;
     }
@@ -544,8 +678,20 @@ export function initAccountsModule() {
           ? '关闭 Antigravity，写入该账号凭据并重新启动'
           : '仅将该账号凭据写入 Windows 凭据管理器（不重启 Antigravity）';
 
+        const isQuotaLoading =
+          state.quotaLoadingIds.has(acc.id) || (state.quotaFetchingAll && acc.backupOk !== false);
+        const isExpanded = state.expandedQuotaId === acc.id;
+        const quotaSnap = state.quotaMap.get(normalizeEmailKey(acc.email));
+
+        const detailRowHtml = isExpanded
+          ? `<tr class="detail-row"><td colspan="6">${renderQuotaDetailHtml(quotaSnap, {
+              showRefreshBtn: true,
+              accountId: acc.id,
+            })}</td></tr>`
+          : '';
+
         return `
-          <tr class="${current ? 'selected' : ''}">
+          <tr class="${current || isExpanded ? 'selected' : ''}">
             <td>
               <div class="acc-email-row">
                 <span class="acc-email mono acc-copyable" data-copy-email="${escapeHtml(
@@ -556,6 +702,9 @@ export function initAccountsModule() {
               <div class="acc-meta mono" title="${escapeHtml(metaTooltip)}">${escapeHtml(
                 metaParts.join(' · ')
               )}</div>
+            </td>
+            <td class="quota-cell" data-act="toggle-quota" data-id="${escapeHtml(acc.id)}" title="点击展开或查询额度明细">
+              ${renderQuotaCellHtml(acc)}
             </td>
             <td>${renameCell}</td>
             <td>
@@ -572,6 +721,11 @@ export function initAccountsModule() {
                 )}" data-locked="${switchLocked ? '1' : '0'}" ${
                   switchLocked ? 'disabled' : ''
                 } title="${escapeHtml(switchTitle)}">${switchBtnText}</button>
+                <button type="button" class="btn" data-act="quota" data-id="${escapeHtml(
+                  acc.id
+                )}" ${isQuotaLoading ? 'disabled' : ''} title="查询该账号套餐等级与剩余额度">${
+                  isQuotaLoading ? '查询中' : '额度'
+                }</button>
                 <button type="button" class="btn acc-pin-btn${
                   acc.pinned ? ' pinned' : ''
                 }" data-act="pin" data-id="${escapeHtml(acc.id)}" title="${
@@ -586,6 +740,7 @@ export function initAccountsModule() {
               </div>
             </td>
           </tr>
+          ${detailRowHtml}
         `;
       })
       .join('');
@@ -655,12 +810,27 @@ export function initAccountsModule() {
         refreshList({ silent: true });
       }
     }, ACTIVE_REFRESH_MS);
+    state.countdownTimer = setInterval(() => {
+      if (
+        state.active &&
+        document.visibilityState === 'visible' &&
+        !state.renamingId &&
+        !state.pendingConfirm &&
+        state.data
+      ) {
+        render();
+      }
+    }, QUOTA_TICK_MS);
   }
 
   function stopActiveRefresh() {
     if (state.activeTimer) {
       clearInterval(state.activeTimer);
       state.activeTimer = null;
+    }
+    if (state.countdownTimer) {
+      clearInterval(state.countdownTimer);
+      state.countdownTimer = null;
     }
   }
 
@@ -741,6 +911,8 @@ export function initAccountsModule() {
             showNotice('检测到新账号，但自动保存失败；请点「保存当前账号」重试。', 'warn');
           }
           await refreshList();
+          window.dispatchEvent(new CustomEvent('agydock:account-switched'));
+          maybeBackgroundFetchCurrentQuota(true);
         }
       } catch (err) {
         appendLog(`[!] 轮询登录状态失败: ${err?.message || err}`);
@@ -815,6 +987,8 @@ export function initAccountsModule() {
     } finally {
       await refreshList();
       setBusy(false);
+      window.dispatchEvent(new CustomEvent('agydock:account-switched'));
+      maybeBackgroundFetchCurrentQuota(true);
     }
   }
 
@@ -880,6 +1054,7 @@ export function initAccountsModule() {
         } finally {
           await refreshList();
           setBusy(false);
+          window.dispatchEvent(new CustomEvent('agydock:account-switched'));
         }
       }
     );
@@ -1007,6 +1182,8 @@ export function initAccountsModule() {
           appendLog(removed ? `[OK] 已删除账号备份 ${acc?.email || id}` : '[i] 该账号已不存在。');
           showNotice(removed ? `已删除账号备份 ${acc?.email || id}` : '该账号已不存在', 'ok');
           await refreshList();
+          window.dispatchEvent(new CustomEvent('agydock:account-switched'));
+          maybeBackgroundFetchCurrentQuota(true);
         } catch (err) {
           appendLog(`[X] 删除失败: ${err?.message || err}`);
           showNotice(`删除失败: ${err?.message || err}`, 'error');
@@ -1015,6 +1192,113 @@ export function initAccountsModule() {
         }
       }
     );
+  }
+
+  function emitQuotaUpdated(snapshots) {
+    const valid = (snapshots || []).filter((s) => s && s.email && s.email !== 'unknown');
+    if (!valid.length) return;
+    window.dispatchEvent(
+      new CustomEvent('agydock:quota-updated', {
+        detail: { source: 'accounts', snapshots: valid },
+      })
+    );
+  }
+
+  async function fetchQuotaForAccount(id, { expand = true, forceRefresh = true } = {}) {
+    if (state.quotaLoadingIds.has(id)) return;
+    state.quotaLoadingIds.add(id);
+    if (expand) {
+      state.expandedQuotaId = id;
+    }
+    render();
+    try {
+      const snap = await tauriInvoke('quota_fetch_account', { id, forceRefresh });
+      const key = normalizeEmailKey(snap?.email);
+      if (key && key !== 'unknown') {
+        state.quotaMap.set(key, snap);
+        emitQuotaUpdated([snap]);
+      }
+      if (snap?.error) {
+        appendLog(`[!] 查询 ${snap.email || id} 额度异常: ${snap.error}`);
+      } else {
+        const tier = snap?.plan?.tierLabel || '未知';
+        const minPct = formatRemainingPct(snap?.minRemainingFraction);
+        appendLog(`[OK] ${snap?.email || id}: ${tier} · 最低剩余 ${minPct}`);
+      }
+    } catch (err) {
+      appendLog(`[X] 查询账号额度失败: ${err?.message || err}`);
+      showNotice(`查询额度失败: ${err?.message || err}`, 'error');
+    } finally {
+      state.quotaLoadingIds.delete(id);
+      render();
+    }
+  }
+
+  async function fetchAllQuotas() {
+    if (state.quotaFetchingAll) return;
+    state.quotaFetchingAll = true;
+    if (els.quotaAllBtn) els.quotaAllBtn.textContent = '查询中...';
+    render();
+    appendLog('[..] 正在批量查询全部已保存账号的套餐等级与剩余额度...');
+    try {
+      const results = await tauriInvoke('quota_fetch_all');
+      let okCount = 0;
+      let errCount = 0;
+      const updated = [];
+      for (const snap of results || []) {
+        const key = normalizeEmailKey(snap?.email);
+        if (key && key !== 'unknown') {
+          state.quotaMap.set(key, snap);
+          updated.push(snap);
+        }
+        if (snap?.error) {
+          errCount += 1;
+          appendLog(`[!] ${snap.email || '未知账号'} 查询异常: ${snap.error}`);
+        } else {
+          okCount += 1;
+        }
+      }
+      emitQuotaUpdated(updated);
+      if (!results || !results.length) {
+        appendLog('[i] 当前没有可查询的已保存账号。');
+        showNotice('当前没有可查询的账号。', 'warn');
+      } else if (errCount === 0) {
+        appendLog(`[OK] 额度刷新完成：共更新 ${okCount} 个账号。`);
+        showNotice(`已更新 ${okCount} 个账号的套餐与剩余额度。`, 'ok');
+      } else {
+        setLogsExpanded(true);
+        showNotice(`额度刷新完成：${okCount} 个成功，${errCount} 个异常（详情见日志）。`, 'warn');
+      }
+    } catch (err) {
+      appendLog(`[X] 批量查询额度失败: ${err?.message || err}`);
+      setLogsExpanded(true);
+      showNotice(`批量查询额度失败: ${err?.message || err}`, 'error');
+    } finally {
+      state.quotaFetchingAll = false;
+      if (els.quotaAllBtn) els.quotaAllBtn.textContent = '刷新全部额度';
+      render();
+    }
+  }
+
+  async function maybeBackgroundFetchCurrentQuota(force = false) {
+    const email = state.data?.current?.email;
+    if (!state.data?.current?.present || !email) return;
+    const key = normalizeEmailKey(email);
+    const existing = state.quotaMap.get(key);
+    const isFresh =
+      existing && !existing.error && existing.fetchedAtMs && Date.now() - existing.fetchedAtMs < QUOTA_STALE_MS;
+    if (!force && isFresh) return;
+    try {
+      const snap = await tauriInvoke('quota_fetch_current', { forceRefresh: false });
+      const snapKey = normalizeEmailKey(snap?.email || email);
+      if (snapKey && snapKey !== 'unknown') {
+        state.quotaMap.set(snapKey, snap);
+        emitQuotaUpdated([snap]);
+        render();
+      }
+    } catch {
+      // ignore background failure
+    }
   }
 
   function attachRowHandlers() {
@@ -1032,12 +1316,32 @@ export function initAccountsModule() {
           return;
         }
         const btn = evt.target.closest('button[data-act]');
-        if (!btn || btn.disabled) return;
-        const id = btn.dataset.id;
-        if (btn.dataset.act === 'switch') await switchTo(id);
-        else if (btn.dataset.act === 'pin') await togglePin(id);
-        else if (btn.dataset.act === 'remove') removeAccount(id);
-        else if (btn.dataset.act === 'rename-btn') await renameAccount(id);
+        if (btn) {
+          if (btn.disabled) return;
+          const id = btn.dataset.id;
+          if (btn.dataset.act === 'switch') await switchTo(id);
+          else if (btn.dataset.act === 'quota' || btn.dataset.act === 'quota-refresh') {
+            await fetchQuotaForAccount(id, { expand: true, forceRefresh: true });
+          } else if (btn.dataset.act === 'pin') await togglePin(id);
+          else if (btn.dataset.act === 'remove') removeAccount(id);
+          else if (btn.dataset.act === 'rename-btn') await renameAccount(id);
+          return;
+        }
+        const toggleCell = evt.target.closest('[data-act="toggle-quota"]');
+        if (toggleCell) {
+          const id = toggleCell.dataset.id;
+          if (state.expandedQuotaId === id) {
+            state.expandedQuotaId = null;
+            render();
+            return;
+          }
+          state.expandedQuotaId = id;
+          render();
+          const acc = state.data?.accounts?.find((a) => a.id === id);
+          if (acc && !state.quotaMap.get(normalizeEmailKey(acc.email))) {
+            await fetchQuotaForAccount(id, { expand: true, forceRefresh: false });
+          }
+        }
       });
       els.tableBody.addEventListener('keydown', (evt) => {
         const input = evt.target.closest('[data-rename-input]');
@@ -1069,6 +1373,7 @@ export function initAccountsModule() {
   els.addBtn.addEventListener('click', addAccount);
   els.saveBtn.addEventListener('click', saveCurrent);
   els.logoutBtn.addEventListener('click', logoutCurrent);
+  els.quotaAllBtn?.addEventListener('click', fetchAllQuotas);
   els.refreshBtn.addEventListener('click', () => refreshList());
   els.detectSaveBtn.addEventListener('click', saveCurrent);
   els.noticeCloseBtn.addEventListener('click', () => showNotice(''));
@@ -1102,6 +1407,130 @@ export function initAccountsModule() {
 
   els.verifyBtn.addEventListener('click', verifyAllBackups);
   els.openDirBtn.addEventListener('click', openStoreDir);
+
+  function applyOAuthStatus(status) {
+    if (!status) return;
+    const src = status.source || 'none';
+    const configured = Boolean(status.configured);
+
+    if (els.oauthBtn) {
+      els.oauthBtn.textContent = configured ? '离线续期 ✓' : '离线续期';
+    }
+    if (els.oauthStatusTag) {
+      let label = '未配置';
+      if (src === 'dpapi') label = '已配置 · DPAPI';
+      else if (src === 'env') label = '已配置 · 环境变量';
+      else if (src === 'file') label = '已配置 · JSON';
+      else if (configured) label = '已配置';
+      els.oauthStatusTag.textContent = label;
+      els.oauthStatusTag.className = configured ? 'tag mono tag-ok' : 'tag mono';
+    }
+    if (els.oauthClientId) {
+      els.oauthClientId.placeholder =
+        configured && status.clientIdPreview
+          ? `当前已配置 ${status.clientIdPreview}（留空保持不变，重新输入可覆盖）`
+          : '粘贴 OAuth Client ID（可选）';
+    }
+    if (els.oauthClientSecret) {
+      els.oauthClientSecret.placeholder = configured
+        ? '已保存（不回显；重新输入并保存可覆盖）'
+        : '粘贴 OAuth Client Secret（保存时经 DPAPI 加密，不回显原文）';
+    }
+    if (els.oauthPathNote) {
+      els.oauthPathNote.textContent =
+        src === 'env'
+          ? `优先使用环境变量 AGYDOCK_OAUTH_CLIENT_ID / AGYDOCK_OAUTH_CLIENT_SECRET（本机加密路径: ${
+              status.configPath || '—'
+            }）`
+          : status.configPath || '—';
+    }
+    if (els.oauthClearBtn) {
+      els.oauthClearBtn.classList.toggle('hidden', src !== 'dpapi' && src !== 'file');
+    }
+  }
+
+  async function loadOAuthStatus() {
+    if (!els.oauthPanel) return;
+    try {
+      const status = await tauriInvoke('quota_oauth_config_status');
+      applyOAuthStatus(status);
+    } catch {
+      // ignore initial status read failures
+    }
+  }
+
+  async function saveOAuthConfig() {
+    if (!els.oauthSaveBtn) return;
+    const clientId = String(els.oauthClientId?.value ?? '').trim();
+    const clientSecret = String(els.oauthClientSecret?.value ?? '').trim();
+    if (!clientId || !clientSecret) {
+      showNotice('请同时填写 Client ID 和 Client Secret。', 'warn');
+      if (!clientId) els.oauthClientId?.focus();
+      else els.oauthClientSecret?.focus();
+      return;
+    }
+
+    els.oauthSaveBtn.disabled = true;
+    if (els.oauthClearBtn) els.oauthClearBtn.disabled = true;
+    const prevText = els.oauthSaveBtn.textContent;
+    els.oauthSaveBtn.textContent = '保存中...';
+    try {
+      const status = await tauriInvoke('quota_oauth_config_save', { clientId, clientSecret });
+      if (els.oauthClientId) els.oauthClientId.value = '';
+      if (els.oauthClientSecret) els.oauthClientSecret.value = '';
+      applyOAuthStatus(status);
+      appendLog(
+        `[OK] 已使用 Windows DPAPI 加密保存本地 OAuth 刷新凭据 (${status?.clientIdPreview || '已配置'})。`
+      );
+      showNotice('已加密保存离线续期配置；现在可随时查询离线账号额度。', 'ok');
+    } catch (err) {
+      appendLog(`[X] 保存离线续期配置失败: ${err?.message || err}`);
+      showNotice(`保存配置失败: ${err?.message || err}`, 'error');
+    } finally {
+      els.oauthSaveBtn.disabled = false;
+      els.oauthSaveBtn.textContent = prevText;
+      if (els.oauthClearBtn) els.oauthClearBtn.disabled = false;
+    }
+  }
+
+  async function clearOAuthConfig() {
+    if (!els.oauthClearBtn) return;
+    els.oauthClearBtn.disabled = true;
+    if (els.oauthSaveBtn) els.oauthSaveBtn.disabled = true;
+    try {
+      const status = await tauriInvoke('quota_oauth_config_clear');
+      if (els.oauthClientId) els.oauthClientId.value = '';
+      if (els.oauthClientSecret) els.oauthClientSecret.value = '';
+      applyOAuthStatus(status);
+      appendLog('[OK] 已清除本机 OAuth 刷新凭据文件。');
+      showNotice(
+        status?.source === 'env'
+          ? '已清除本地凭据文件（环境变量配置仍生效）。'
+          : '已清除离线续期配置。',
+        'ok'
+      );
+    } catch (err) {
+      appendLog(`[X] 清除离线续期配置失败: ${err?.message || err}`);
+      showNotice(`清除配置失败: ${err?.message || err}`, 'error');
+    } finally {
+      els.oauthClearBtn.disabled = false;
+      if (els.oauthSaveBtn) els.oauthSaveBtn.disabled = false;
+    }
+  }
+
+  els.oauthBtn?.addEventListener('click', () => {
+    if (!els.oauthPanel) return;
+    const willShow = els.oauthPanel.classList.contains('hidden');
+    els.oauthPanel.classList.toggle('hidden', !willShow);
+    if (willShow) {
+      loadOAuthStatus();
+    }
+  });
+  els.oauthCloseBtn?.addEventListener('click', () => {
+    els.oauthPanel?.classList.add('hidden');
+  });
+  els.oauthSaveBtn?.addEventListener('click', saveOAuthConfig);
+  els.oauthClearBtn?.addEventListener('click', clearOAuthConfig);
 
   els.confirmOkBtn.addEventListener('click', () => {
     const fn = state.pendingConfirm;
@@ -1141,6 +1570,21 @@ export function initAccountsModule() {
     if (state.initialized) return;
     state.initialized = true;
     appendLog('[i] 就绪：凭据存于 Windows 凭据管理器，本地备份使用 DPAPI 加密，托盘右键可快速切换。');
+    window.addEventListener('agydock:quota-updated', (evt) => {
+      const detail = evt.detail || {};
+      if (detail.source === 'accounts') return;
+      let changed = false;
+      for (const snap of detail.snapshots || []) {
+        const key = normalizeEmailKey(snap?.email);
+        if (key && key !== 'unknown') {
+          state.quotaMap.set(key, snap);
+          changed = true;
+        }
+      }
+      if (changed && state.data) {
+        render();
+      }
+    });
     if (tauriListen && !state.unlistenTray) {
       try {
         state.unlistenTray = await tauriListen('accounts-changed', (event) => {
@@ -1152,13 +1596,23 @@ export function initAccountsModule() {
             setLogsExpanded(true);
             showNotice(`托盘切换失败: ${payload.error}`, 'error');
           }
-          refreshList({ silent: true });
+          refreshList({ silent: true }).then(() => maybeBackgroundFetchCurrentQuota(true));
         });
       } catch {
         // ignore event registration failures
       }
     }
+    loadOAuthStatus();
+    try {
+      const cachedMap = await tauriInvoke('quota_get_cached').catch(() => ({}));
+      for (const [k, v] of Object.entries(cachedMap || {})) {
+        state.quotaMap.set(normalizeEmailKey(k), v);
+      }
+    } catch {
+      // ignore cache load errors
+    }
     await refreshList();
+    maybeBackgroundFetchCurrentQuota(false);
   }
 
   return {
